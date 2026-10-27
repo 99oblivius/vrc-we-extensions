@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["sdk", "template", "extensions/camera", "extensions/twitch", "tools/index"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.89"
+repository = "https://github.com/99oblivius/vrc-we-extensions"
+publish = false
+
+# What a module is built for, where a tool that reads cargo's metadata finds
+# it (the index tool does); a person types `cargo wasm`.
+[workspace.metadata.vrc-we]
+target = "wasm32-unknown-unknown"
+
+[workspace.dependencies]
+vrc-we-sdk = { path = "sdk" }
+
+base64 = "0.22"
+glam = "0.30"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+serde_json = "1"
+thiserror = "2"
+
+# A module's size and speed in the client's interpreter.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
