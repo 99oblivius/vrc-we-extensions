@@ -17,7 +17,7 @@ target = "wasm32-unknown-unknown"
 [workspace.dependencies]
 vrc-we-sdk = { path = "sdk" }
 
-base64 = "0.22"
+base64 = "0.23"
 glam = "0.30"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
