@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# The module target: no OS, no vendor — a bare WebAssembly module with no
+# imports, which is what the client's sandbox runs.
+targets = ["wasm32-unknown-unknown"]

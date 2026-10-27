@@ -1,0 +1,18 @@
+[package]
+name = "template"
+description = "Copy this directory to start an extension"
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vrc-we-sdk = { workspace = true }
+
+# Deliberately no `[package.metadata.vrc-we]`: the index tool publishes only
+# crates that declare it, and the template is a starting point, never released.

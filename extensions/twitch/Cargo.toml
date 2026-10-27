@@ -1,0 +1,23 @@
+[package]
+name = "twitch"
+authors = ["oblivius"]
+description = "Twitch chat, redeems, subs, cheers, raids, hype trains and follows as triggers"
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# It goes in the repository's index.
+[package.metadata.vrc-we]
+index = true
+mature = false
+
+[dependencies]
+vrc-we-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

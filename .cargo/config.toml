@@ -1,0 +1,7 @@
+# The build of a module, in one spelling. `rust-toolchain.toml` installs the
+# target, the workspace metadata states it for tools that read cargo's own
+# output, and this alias is what a person or CI types.
+[alias]
+wasm = "build --release --target wasm32-unknown-unknown"
+# The whole set, built and copied beside the index.
+modules = "run -q -p index -- --name official --out dist"
