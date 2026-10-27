@@ -32,7 +32,7 @@ jobs:
       # The tool builds every crate it lists for the target the workspace
       # states, so this is also the "does a module build" check.
       - run: cargo run -p index --locked -- --name official --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: index
           path: dist/
