@@ -2,14 +2,14 @@
 
 Twitch as `@TWITCH`. Chat, channel point redemptions, subscriptions, cheers, raids, hype trains, follows, polls and the stream's own live state arrive over one EventSub WebSocket. Sending is seven actions over Helix.
 
-It is the networked worked example: OAuth with the person's own token, an authenticated socket, HTTP calls the host performs, and a page that reports what it listens for.
+It is the networked worked example: OAuth through Twitch's device grant with the person's own token, an authenticated socket, HTTP calls the host performs, and a page that reports what it listens for.
 
 ## What it declares
 
 | Part | What |
 |---|---|
 | namespace | `@TWITCH`: the fields below, one signal per event group, eight conditions |
-| page | `twitch`: the token fields, what is being listened for, the last event, the last error |
+| page | `twitch`: the connect link, what is being listened for, the last event, the last error |
 | actions | `chat`, `clip`, `marker`, `announce`, `title`, `commercial`, `poll` |
 | secrets | `auth` (`Bearer <token>`) and `refresh` |
 | network | `id.twitch.tv`, `api.twitch.tv`, `eventsub.wss.twitch.tv`, TCP 443 |
@@ -38,24 +38,20 @@ It writes nothing into VRChat. The module has no OSC grant at all.
 
 ## The token
 
-No Twitch application is registered for this module, and no client id ships in it. The person pastes a user access token, and optionally a refresh token, into the masked fields on the page.
+The module ships one application's client id (`CLIENT_ID`), which Twitch treats as public: it travels in every authorize URL and is not a secret. A fork must register its own and replace it; Twitch forbids sharing one client id among applications.
 
-`/oauth2/validate` reports the client it was issued to, the account, the scopes and the remaining life. Every Helix call then carries that client id.
+The sign-in is the **device authorization grant** for a public client — the only secret-free flow that also yields a refresh token. Nothing is typed into the client and no redirect URI is involved:
 
-A renewal posts `grant_type=refresh_token` with the client id and no secret, because a public client has none. Twitch answers a new access token and a new refresh token, and both are stored.
+1. **Ask.** `POST /oauth2/device` with the client id and every scope the module can need. Twitch answers a `device_code` this build polls, an `interval`, an expiry, and a `verification_uri` **with the user code already in it**.
+2. **Approve.** The page shows that address as a link; Twitch asks the person to sign in and approve the client there.
+3. **Poll.** `POST /oauth2/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code` at the interval Twitch gave, until it answers the pair — or `authorization_pending` (ask again), `slow_down` (widen the interval), or an expiry (start over).
+4. **Keep.** `auth` holds `Bearer <access>`; `refresh` holds the one-time refresh token.
+5. **Name.** `GET /oauth2/validate` reports the account, the scopes and the remaining life; the renewal timer is set a minute before it ends.
+6. **Renew.** `POST /oauth2/token` with `grant_type=refresh_token` and no secret. Twitch rotates the pair, and both halves replace the old ones. A refresh token unused for 30 days expires, and the page asks the person to connect again: one click.
 
-A group whose scope the token lacks is not subscribed, and the page names it. An action refused with 403 names the scope it needed. A 401 renews the token and sends the action again, once. A refused renewal says what Twitch said and asks for a new token.
+A group whose scope the token lacks is not subscribed, and the page names it. An action refused with 403 names the scope it needed. A 401 renews the token and sends the action again, once. A refused renewal says what Twitch said and asks to connect again.
 
-The flow, in order:
-
-1. **Paste.** The page's fields are stored as keyring secrets. `auth` holds `Bearer <token>`, `refresh` holds the token as it came. The fields are then cleared.
-2. **Check.** `GET /oauth2/validate` takes the token alone, with no client id. It answers the client id, the account, the scopes and the time left.
-3. **Arm.** The renewal timer is set a minute before that life ends, so a session running for weeks renews before anything is refused.
-4. **Renew.** `POST /oauth2/token` with `grant_type=refresh_token`, the discovered client id and the refresh token. A public client has no `client_secret` to send. Twitch answers a new access token and a new refresh token, and both replace the old pair.
-5. **Repeat once.** An action that met a 401 is sent again after the renewal. Twitch refused it before doing anything, so it is not done twice. A second refusal is reported.
-6. **Ask.** A refused renewal, which is what `invalid_grant` means once a public client's refresh token is 30 days old, shows Twitch's own message and asks for a new token. Nothing is silently retried.
-
-No OAuth crate is used. `twitch_oauth2` and the older `twitch-oauth` are async clients with their own HTTP stack, client secrets and redirect listeners. A sandboxed module has no socket, no clock and no HTTP, because the host makes every request. The six steps above are the whole client.
+No OAuth crate is used, and none would fit: `twitch_oauth2` and the older `twitch-oauth` are async clients with their own HTTP stack, client secrets and redirect listeners. A sandboxed module has no socket, no clock and no HTTP of its own, because the host makes every request. The flow above is the whole client.
 
 ## Files
 

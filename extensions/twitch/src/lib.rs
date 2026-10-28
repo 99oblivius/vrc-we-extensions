@@ -1,25 +1,25 @@
 //! Twitch for mappings: chat messages, channel point redemptions, subs, cheers,
 //! raids, hype trains and follows arrive over one EventSub WebSocket, and a
-//! mapping reacts to them. The page is setup and maintenance only: the person's
-//! token, which events to listen for, and what went wrong last.
+//! mapping reacts to them. The page is setup and maintenance only: whether the
+//! account is connected, what is being listened for, and what went wrong last.
 //!
-//! The token is the person's own user token, pasted once and kept in the OS
-//! keyring. `/oauth2/validate` names the client it was issued to and the scopes
-//! it carries, so no application is registered for this module and every Helix
-//! call carries the token's own client id. A public client renews without a
-//! secret, so a pasted refresh token keeps it alive until Twitch's own 30-day
-//! limit on a public client's refresh token.
+//! The token is the person's own user token, obtained through Twitch's device
+//! authorization grant with a public client: the module asks for a code, the
+//! page offers Twitch's own address with that code already in it, and the
+//! person approves there. Nothing is typed into the client, and there is no
+//! redirect and no client secret. The pair lives in the OS keyring;
+//! `/oauth2/validate` names the account, the client and the scopes, and every
+//! Helix call carries the application's client id.
 //!
-//! The flow end to end: the page's fields are stored as keyring secrets (`auth`
-//! as `Bearer <token>`, `refresh` as it came), the check answers with the
-//! client id, account, scopes and life, the renewal timer is armed a minute
-//! before that life ends, and the socket subscribes what the client says its
-//! rules read. A renewal posts `grant_type=refresh_token` with the discovered
-//! client id and no secret; Twitch answers with a new access token *and* a new
-//! refresh token, both kept. The action that met the 401 is repeated once.
-//! Twitch refused it before doing anything, so repeating it is not doing it
-//! twice. A refused renewal shows Twitch's own message and asks for a new
-//! token, which is what a public client's 30 day refresh token gives.
+//! A public client's refresh token is one-time use and expires after 30 days
+//! unused, so every renewal rotates both halves and a lapsed one sends the
+//! person back through one approval. The flow end to end: the page's Connect
+//! asks `/oauth2/device` for a code, the page shows the verification address,
+//! the module polls `/oauth2/token` at the interval Twitch gave, and the
+//! answer is stored and checked. The renewal timer is armed a minute before
+//! the access token's life ends. The socket subscribes what the client says
+//! its rules read. The action that met the 401 is repeated once: Twitch
+//! refused it before doing anything, so repeating it is not doing it twice.
 //!
 //! Build: `cargo wasm -p twitch`.
 
@@ -52,6 +52,12 @@ const SCOPE_BROADCAST: &str = "channel:manage:broadcast";
 const SCOPE_ANNOUNCE: &str = "moderator:manage:announcements";
 const SCOPE_COMMERCIAL: &str = "channel:edit:commercial";
 const SCOPE_POLLS: &str = "channel:manage:polls";
+
+/// The Twitch application this build asks for a token. A client id is public
+/// — Twitch says so, and it travels in every authorize URL — but it names one
+/// application: a fork must register its own and replace this, since reusing
+/// it would be a second application in Twitch's eyes.
+const CLIENT_ID: &str = "awyzerbycsfre9z9rsox3q0wlpnn9r";
 
 /// How long before a token's expiry it is renewed.
 const REFRESH_LEAD_MS: u64 = 60_000;
@@ -183,7 +189,13 @@ pub(crate) enum Phase {
 enum Pending {
     Validate,
     Refresh,
-    Subscribe { group: Group },
+    /// Asking Twitch for a device code.
+    Device,
+    /// Asking whether the person has approved it yet.
+    DeviceToken,
+    Subscribe {
+        group: Group,
+    },
     Chat,
     Clip,
     Marker,
@@ -221,9 +233,9 @@ pub struct Twitch {
     /// The socket a reconnect_url opened, closed once the new session is up.
     old_ws: Option<u64>,
     keepalive_ms: u64,
-    /// What the token field holds before it is stored; cleared once it is.
-    token_field: String,
-    refresh_field: String,
+    /// The sign-in that is waiting on the person: Twitch's code, the address
+    /// to approve at, and how often to ask.
+    device: Option<protocol::DeviceCode>,
     /// Groups the token's scopes can't subscribe, and the scope each needs.
     missing: Vec<(Group, &'static str)>,
     /// The action request that is out, if one is.
@@ -243,6 +255,86 @@ impl Twitch {
     /// The client the held token was issued to: every Helix call names it.
     fn client_id(&self) -> Option<&str> {
         self.identity.as_ref().map(|i| i.client_id.as_str())
+    }
+
+    /// Every scope this build may ever ask for, so a rule added later does not
+    /// send the person through Twitch's consent again.
+    fn scopes() -> String {
+        let mut set: Vec<&'static str> = GROUPS.iter().filter_map(|g| g.scope()).collect();
+        for scope in [
+            SCOPE_CHAT,
+            SCOPE_CLIP,
+            SCOPE_BROADCAST,
+            SCOPE_ANNOUNCE,
+            SCOPE_COMMERCIAL,
+            SCOPE_POLLS,
+        ] {
+            if !set.contains(&scope) {
+                set.push(scope);
+            }
+        }
+        set.join(" ")
+    }
+
+    /// Starts a device authorization: Twitch answers with a code this build
+    /// polls and an address the person opens, code included. No redirect, no
+    /// secret, nothing typed.
+    fn start_device(&mut self, out: &mut Vec<Command>) {
+        if self.device.is_some() {
+            return;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        out.push(Command::Http {
+            id,
+            method: "POST".into(),
+            url: protocol::DEVICE_URL.into(),
+            headers: vec![(
+                "Content-Type".to_owned(),
+                Header::Text("application/x-www-form-urlencoded".to_owned()),
+            )],
+            body: Some(Data::Text(protocol::device_body(
+                CLIENT_ID,
+                &Self::scopes(),
+            ))),
+        });
+        self.pending.insert(id, Pending::Device);
+        self.error = None;
+    }
+
+    /// Asks whether the person has approved the waiting code yet.
+    fn poll_device(&mut self, out: &mut Vec<Command>) {
+        let Some(code) = self.device.as_ref().map(|d| d.code.clone()) else {
+            return;
+        };
+        self.next_id += 1;
+        let id = self.next_id;
+        out.push(Command::Http {
+            id,
+            method: "POST".into(),
+            url: protocol::TOKEN_URL.into(),
+            headers: vec![(
+                "Content-Type".to_owned(),
+                Header::Text("application/x-www-form-urlencoded".to_owned()),
+            )],
+            body: Some(Data::Text(protocol::device_token_body(
+                CLIENT_ID,
+                &Self::scopes(),
+                &code,
+            ))),
+        });
+        self.pending.insert(id, Pending::DeviceToken);
+    }
+
+    /// The sign-in was cancelled or expired: stop asking.
+    fn cancel_device(&mut self, out: &mut Vec<Command>) {
+        self.device = None;
+        out.push(Command::CancelTimer {
+            id: "device-poll".into(),
+        });
+        out.push(Command::CancelTimer {
+            id: "device-expire".into(),
+        });
     }
 
     /// Asks `method url` with the token's client id, the bearer when `auth`,
@@ -469,8 +561,7 @@ impl Twitch {
             phase: self.phase(),
             logged_in: self.identity.is_some(),
             who: self.identity.as_ref().map_or("", |i| i.login.as_str()),
-            token_field: &self.token_field,
-            refresh_field: &self.refresh_field,
+            device: self.device.as_ref().map(|d| d.link.as_str()),
             groups: &groups,
             missing: &self.missing,
             last: self.last.as_ref(),
@@ -591,6 +682,12 @@ impl Extension for Twitch {
             }
             Event::Closed { .. } => {}
             Event::Timer { id, .. } => match id.as_str() {
+                "device-poll" => self.poll_device(&mut out),
+                "device-expire" => {
+                    self.cancel_device(&mut out);
+                    self.error = Some("The sign-in expired: connect again.".into());
+                }
+                "after-token" => self.validate(&mut out),
                 "refresh" => self.refresh(&mut out),
                 "retry" => self.connect(&mut out),
                 "watchdog" => {
@@ -680,6 +777,80 @@ impl Twitch {
                     self.expired_with(out, why);
                 }
             },
+            Pending::Device => match (status, protocol::parse_device(&parsed)) {
+                (200, Ok(device)) => {
+                    let (interval, expires) = (device.interval_ms, device.expires_ms);
+                    self.device = Some(device);
+                    self.error = None;
+                    out.push(Command::Timer {
+                        id: "device-poll".into(),
+                        after_ms: interval,
+                    });
+                    out.push(Command::Timer {
+                        id: "device-expire".into(),
+                        after_ms: expires,
+                    });
+                }
+                (_, Ok(_)) => {
+                    self.error = Some(
+                        protocol::parse_error(&parsed)
+                            .unwrap_or_else(|| format!("Twitch refused the sign-in ({status})")),
+                    );
+                }
+                (_, Err(e)) => self.error = Some(e),
+            },
+            Pending::DeviceToken => match status {
+                200 => match protocol::parse_token(&parsed) {
+                    Ok(token) => {
+                        self.cancel_device(out);
+                        self.store_token(out, &token);
+                        // The token is in the keyring now; a beat later the
+                        // check reads it and names the account.
+                        self.phase = Some(Phase::Connecting);
+                        self.identity = None;
+                        self.error = None;
+                        out.push(Command::Timer {
+                            id: "after-token".into(),
+                            after_ms: 500,
+                        });
+                    }
+                    Err(e) => self.error = Some(e),
+                },
+                400 => {
+                    let why = parsed
+                        .get("message")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    if why.contains("authorization_pending") {
+                        let wait = self.device.as_ref().map_or(5_000, |d| d.interval_ms);
+                        out.push(Command::Timer {
+                            id: "device-poll".into(),
+                            after_ms: wait,
+                        });
+                    } else if why.contains("slow_down") {
+                        let wait = self.device.as_mut().map_or(10_000, |d| {
+                            d.interval_ms = d.interval_ms.saturating_add(5_000);
+                            d.interval_ms
+                        });
+                        out.push(Command::Timer {
+                            id: "device-poll".into(),
+                            after_ms: wait,
+                        });
+                    } else {
+                        let why = protocol::parse_error(&parsed)
+                            .unwrap_or_else(|| "the sign-in expired".to_owned());
+                        self.cancel_device(out);
+                        self.error = Some(why);
+                    }
+                }
+                _ => {
+                    let why = protocol::parse_error(&parsed)
+                        .unwrap_or_else(|| format!("the sign-in was refused ({status})"));
+                    self.cancel_device(out);
+                    self.error = Some(why);
+                }
+            },
             Pending::Subscribe { group } => {
                 if status == 202 {
                     self.error = None;
@@ -741,10 +912,7 @@ impl Twitch {
 
     /// A token that can't be renewed: the page asks for a new one.
     fn expired(&mut self, out: &mut Vec<Command>) {
-        self.expired_with(
-            out,
-            "The token expired or was refused: paste a new one.".into(),
-        );
+        self.expired_with(out, "Twitch refused the token: connect again.".into());
     }
 
     /// The same, with what Twitch said about it.
@@ -762,34 +930,6 @@ impl Twitch {
         out.extend(self.publish());
     }
 
-    /// Stores what the page's token fields hold and asks what the token is.
-    fn connect_with_the_field(&mut self, out: &mut Vec<Command>) {
-        let token = self.token_field.trim().to_owned();
-        if token.is_empty() {
-            self.error = Some("Paste your user access token first.".into());
-            return;
-        }
-        out.push(Command::StoreSecret {
-            slot: SECRET_AUTH.into(),
-            value: format!("Bearer {token}"),
-        });
-        let refresh = self.refresh_field.trim().to_owned();
-        if !refresh.is_empty() {
-            out.push(Command::StoreSecret {
-                slot: SECRET_REFRESH.into(),
-                value: refresh,
-            });
-        }
-        self.token_field.clear();
-        self.refresh_field.clear();
-        self.identity = None;
-        self.subscribed.clear();
-        self.missing.clear();
-        self.error = None;
-        self.phase = Some(Phase::Connecting);
-        self.validate(out);
-    }
-
     fn refresh(&mut self, out: &mut Vec<Command>) {
         out.push(Command::LoadSecret {
             slot: SECRET_REFRESH.into(),
@@ -799,9 +939,8 @@ impl Twitch {
     fn ui(&mut self, event: UiEvent) -> Vec<Command> {
         let mut out = Vec::new();
         match event {
-            UiEvent::Text { id, value } if id == "token" => self.token_field = value,
-            UiEvent::Text { id, value } if id == "refresh" => self.refresh_field = value,
-            UiEvent::Pressed { id } if id == "connect" => self.connect_with_the_field(&mut out),
+            UiEvent::Pressed { id } if id == "connect" => self.start_device(&mut out),
+            UiEvent::Pressed { id } if id == "cancel" => self.cancel_device(&mut out),
             UiEvent::Pressed { id } if id == "forget" => out.extend(self.logout()),
             UiEvent::Pressed { id } if id == "reconnect" => {
                 if let Some(ws) = self.ws.take() {
@@ -834,6 +973,7 @@ impl Twitch {
             out.push(Command::Close { id: ws });
         }
         self.identity = None;
+        self.device = None;
         self.subscribed.clear();
         self.phase = Some(Phase::Off);
         self.error = None;
@@ -1489,68 +1629,94 @@ mod tests {
     }
 
     #[test]
-    fn a_pasted_token_is_stored_and_checked_without_a_client_id() {
+    fn connecting_starts_a_device_sign_in_and_the_page_carries_its_link() {
         let mut t = Twitch::default();
-        let out = t.handle(Event::Ui {
-            page: PAGE.into(),
-            event: UiEvent::Text {
-                id: "token".into(),
-                value: "abc".into(),
-            },
-        });
-        assert!(out.is_empty() || !out.iter().any(|c| matches!(c, Command::Http { .. })));
         let out = t.handle(Event::Ui {
             page: PAGE.into(),
             event: UiEvent::Pressed {
                 id: "connect".into(),
             },
         });
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::StoreSecret { slot, value }
-                if slot == SECRET_AUTH && value == "Bearer abc")),
-            "the token is kept as what both Helix and the check take: {out:?}"
-        );
-        let (id, headers) = out
+        let (id, body) = out
             .iter()
             .find_map(|c| match c {
-                Command::Http {
-                    id,
-                    method,
-                    url,
-                    headers,
-                    ..
-                } if method == "GET" && url == protocol::VALIDATE_URL => {
-                    Some((*id, headers.clone()))
-                }
+                Command::Http { id, url, body, .. } if url == protocol::DEVICE_URL => Some((
+                    *id,
+                    match body {
+                        Some(Data::Text(text)) => text.clone(),
+                        _ => String::new(),
+                    },
+                )),
                 _ => None,
             })
-            .expect("a check");
+            .expect("a device request");
         assert!(
-            !headers.iter().any(|(name, _)| name == "Client-Id"),
-            "the check is the one call that names no client: {headers:?}"
+            body.contains("client_id=") && body.contains("scopes="),
+            "the application and every scope it may need: {body}"
         );
-        assert!(t.token_field.is_empty(), "the field forgets what it stored");
+        assert!(
+            !out.iter().any(|c| matches!(c, Command::StoreSecret { .. })),
+            "nothing is stored before the person approves"
+        );
 
+        // Twitch answers with the code to poll and the address to approve,
+        // code already in it.
         let out = t.handle(Event::Http {
             id,
             response: answer(
                 200,
-                r#"{"client_id":"cid","login":"streamer","scopes":["user:read:chat"],"user_id":"1337","expires_in":3600}"#,
+                r#"{"device_code":"dc","expires_in":1800,"interval":5,"user_code":"ABCDEFGH","verification_uri":"https://www.twitch.tv/activate?public=true&device-code=ABCDEFGH"}"#,
             ),
         });
         assert!(
             out.iter()
-                .any(|c| matches!(c, Command::Store { key, .. } if key == K_IDENTITY)),
-            "what the token is, is kept: {out:?}"
+                .any(|c| matches!(c, Command::Timer { id, after_ms }
+                if id == "device-poll" && *after_ms == 5_000)),
+            "the poll waits the interval it was given: {out:?}"
         );
         assert!(
-            out.iter().any(|c| matches!(c, Command::Open { .. })),
-            "and the socket opens"
+            out.iter().any(|c| matches!(c, Command::Page { view, .. }
+                if format!("{view:?}").contains("twitch.tv/activate"))),
+            "the page offers the address, not a field"
         );
-        assert_eq!(
-            t.identity.as_ref().map(|i| i.client_id.as_str()),
-            Some("cid")
+    }
+
+    #[test]
+    fn an_approved_sign_in_keeps_both_tokens_and_then_names_the_account() {
+        let mut t = Twitch {
+            device: Some(protocol::DeviceCode {
+                code: "dc".into(),
+                link: "https://www.twitch.tv/activate?public=true&device-code=ABCDEFGH".into(),
+                interval_ms: 5_000,
+                expires_ms: 1_800_000,
+            }),
+            ..Twitch::default()
+        };
+        t.pending.insert(1, Pending::DeviceToken);
+        let out = t.handle(Event::Http {
+            id: 1,
+            response: answer(
+                200,
+                r#"{"access_token":"abc","refresh_token":"ref","expires_in":14400,"scope":["user:read:chat"],"token_type":"bearer"}"#,
+            ),
+        });
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::StoreSecret { slot, value }
+                if slot == SECRET_AUTH && value == "Bearer abc")),
+            "the access token is kept as both Helix and the check take it"
+        );
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::StoreSecret { slot, value }
+                if slot == SECRET_REFRESH && value == "ref")),
+            "and its one-time refresh token, which Twitch rotates"
+        );
+        assert!(t.device.is_none(), "the waiting code is spent");
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::Timer { id, .. } if id == "after-token")),
+            "the check follows once the keyring holds it: {out:?}"
         );
     }
 

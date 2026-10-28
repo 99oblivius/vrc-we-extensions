@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 /// Helix call carries), the account, the scopes, and how long it lasts. No
 /// client id is needed to ask, and it takes the `Bearer` prefix Helix does.
 pub const VALIDATE_URL: &str = "https://id.twitch.tv/oauth2/validate";
+/// The device authorization endpoint: the one call that starts a sign-in with
+/// no secret and no redirect. Twitch's answer carries the address a person
+/// opens with the code already in it, so nothing is typed.
+pub const DEVICE_URL: &str = "https://id.twitch.tv/oauth2/device";
 pub const TOKEN_URL: &str = "https://id.twitch.tv/oauth2/token";
 pub const SUBSCRIPTIONS_URL: &str = "https://api.twitch.tv/helix/eventsub/subscriptions";
 pub const CHAT_URL: &str = "https://api.twitch.tv/helix/chat/messages";
@@ -182,6 +186,62 @@ pub struct Identity {
     /// arms its renewal from this, so a session that runs for weeks renews
     /// before anything is refused.
     pub expires_ms: u64,
+}
+
+/// What `POST /oauth2/device` answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCode {
+    /// The code this build polls with; the person never sees it.
+    pub code: String,
+    /// Where the person approves: Twitch puts the user code in this URL.
+    pub link: String,
+    /// How often it may ask, and how long the whole thing is good for.
+    pub interval_ms: u32,
+    pub expires_ms: u32,
+}
+
+/// `POST /oauth2/device`'s form body: the client this build belongs to, and
+/// every scope it may ever need.
+pub fn device_body(client_id: &str, scopes: &str) -> String {
+    form(&[("client_id", client_id), ("scopes", scopes)])
+}
+
+/// `POST /oauth2/token`'s form body while waiting: RFC 8628's device grant.
+pub fn device_token_body(client_id: &str, scopes: &str, device_code: &str) -> String {
+    form(&[
+        ("client_id", client_id),
+        ("scopes", scopes),
+        ("device_code", device_code),
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+    ])
+}
+
+/// The device authorization answer, or why it isn't one.
+pub fn parse_device(body: &Value) -> Result<DeviceCode, String> {
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{key} missing"))
+    };
+    Ok(DeviceCode {
+        code: text("device_code")?,
+        link: text("verification_uri")?,
+        interval_ms: u32::try_from(
+            body.get("interval")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .saturating_mul(1000),
+        )
+        .unwrap_or(u32::MAX),
+        expires_ms: u32::try_from(
+            body.get("expires_in")
+                .and_then(Value::as_u64)
+                .unwrap_or(1800)
+                .saturating_mul(1000),
+        )
+        .unwrap_or(u32::MAX),
+    })
 }
 
 /// `POST /oauth2/token`'s form body to renew a token. A public client needs

@@ -1,6 +1,6 @@
-//! The module's page: the token to paste, what is being listened for, the last
-//! event and the last error. It reads a snapshot of the module, never the
-//! machine itself.
+//! The module's page: connect (Twitch's own approval link while one waits),
+//! what is being listened for, the last event and the last error. It reads a
+//! snapshot of the module, never the machine itself.
 
 use vrc_we_sdk::Node;
 
@@ -14,8 +14,8 @@ pub(crate) struct Status<'a> {
     pub logged_in: bool,
     /// The account the token belongs to, empty before the check.
     pub who: &'a str,
-    pub token_field: &'a str,
-    pub refresh_field: &'a str,
+    /// The address Twitch waits for an approval at, while one is waiting.
+    pub device: Option<&'a str>,
     /// The groups the person's rules and scripts read.
     pub groups: &'a [Group],
     /// Groups the token's scopes cannot subscribe, and the scope each needs.
@@ -35,22 +35,22 @@ pub(crate) fn view(status: &Status) -> Node {
     if status.logged_in {
         rows.push(button("reconnect", "Reconnect"));
         rows.push(button("forget", "Forget the token"));
+    } else if let Some(link) = status.device {
+        rows.push(Node::Text(
+            "Approve this client on Twitch; the page is already waiting. Nothing is typed here."
+                .into(),
+        ));
+        rows.push(Node::Link {
+            label: "Authorize on Twitch".into(),
+            url: link.to_owned(),
+        });
+        rows.push(button("cancel", "Cancel"));
     } else {
-        rows.push(Node::TextInput {
-            id: "token".into(),
-            label: "User access token".into(),
-            value: status.token_field.to_owned(),
-            live: false,
-            secret: true,
-        });
-        rows.push(Node::TextInput {
-            id: "refresh".into(),
-            label: "Refresh token, if you have one".into(),
-            value: status.refresh_field.to_owned(),
-            live: false,
-            secret: true,
-        });
-        rows.push(button("connect", "Connect"));
+        rows.push(Node::Text(
+            "Twitch asks you to approve this client once, in your browser. Nothing is typed here."
+                .into(),
+        ));
+        rows.push(button("connect", "Connect with Twitch"));
     }
     rows.push(Node::Divider);
     rows.push(Node::Text(match status.groups.len() {
@@ -99,9 +99,13 @@ pub(crate) fn view(status: &Status) -> Node {
 /// The headline and the line under it.
 fn headline(status: &Status) -> (String, String) {
     match status.phase {
+        Phase::Off if status.device.is_some() => (
+            "Waiting for Twitch".into(),
+            "Approve the sign-in in the page that opened.".into(),
+        ),
         Phase::Off => (
             "Not connected".into(),
-            "Paste your own user access token to read your channel.".into(),
+            "Connect to read your channel.".into(),
         ),
         Phase::Connecting => ("Connecting".into(), format!("As {}.", status.who)),
         Phase::Live { .. } => ("Live".into(), format!("As {}, listening.", status.who)),
