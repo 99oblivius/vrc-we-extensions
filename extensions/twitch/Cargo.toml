@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # It goes in the repository's index.
 [package.metadata.vrc-we]
 index = true
-mature = false
+disclosures = ["account"]
 
 [dependencies]
 vrc-we-sdk = { workspace = true }

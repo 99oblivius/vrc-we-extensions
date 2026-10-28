@@ -16,7 +16,7 @@ crate-type = ["cdylib", "rlib"]
 # and the description from here, so nothing is restated.
 [package.metadata.vrc-we]
 index = true
-mature = false
+disclosures = []
 
 [dependencies]
 vrc-we-sdk = { workspace = true }

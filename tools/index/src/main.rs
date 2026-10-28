@@ -20,6 +20,11 @@ use sha2::{Digest, Sha256};
 /// The index's format, which the client refuses if it differs.
 const FORMAT: u32 = 1;
 
+/// Most disclosures one extension may declare, and the longest each may be.
+/// The client prints them verbatim, so a longer list stops being a summary.
+const DISCLOSURES_MAX: usize = 8;
+const DISCLOSURE_MAX: usize = 64;
+
 #[derive(Debug)]
 enum Error {
     /// cargo didn't run, or didn't answer with metadata.
@@ -31,6 +36,10 @@ enum Error {
     /// A package marked for the index has a metadata table this tool can't
     /// read.
     Marked(String),
+    /// A marked package declares disclosures the client can't print: not a
+    /// list of strings, too many, or one that is empty, too long or carries
+    /// a control character.
+    Disclosures(String, String),
     /// A marked package didn't build for the target.
     Build(String, String),
     /// A marked package's module isn't where cargo puts it.
@@ -49,6 +58,7 @@ impl fmt::Display for Error {
                 "the workspace states no [workspace.metadata.vrc-we] target"
             ),
             Self::Marked(w) => write!(f, "{w}: package.metadata.vrc-we must be an object"),
+            Self::Disclosures(p, w) => write!(f, "{p}: disclosures {w}"),
             Self::Build(p, e) => write!(f, "{p} didn't build for the target: {e}"),
             Self::Missing(p) => {
                 write!(f, "{} isn't built: cargo wasm for its package", p.display())
@@ -80,7 +90,11 @@ struct Marked {
     version: String,
     author: String,
     description: String,
-    mature: bool,
+    /// What the extension lets a person know about itself before install:
+    /// free identifiers it decides on (`device_control`, `account`), shown
+    /// verbatim beside the usual details and summarised when its repository
+    /// is added.
+    disclosures: Vec<String>,
     /// Its cdylib's file name, without the extension.
     lib: String,
 }
@@ -157,10 +171,7 @@ fn run() -> Result<String, Error> {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            mature: table
-                .get("mature")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            disclosures: disclosures(package_name, table)?,
             lib: package["targets"]
                 .as_array()
                 .and_then(|targets| {
@@ -198,7 +209,7 @@ fn run() -> Result<String, Error> {
             "version": package.version,
             "author": package.author,
             "description": package.description,
-            "mature": package.mature,
+            "disclosures": package.disclosures,
             "wasm": file,
             "sha256": sha256,
             "size": bytes.len(),
@@ -222,6 +233,41 @@ fn run() -> Result<String, Error> {
 
 fn label(package: &Value) -> String {
     package["name"].as_str().unwrap_or("a package").to_owned()
+}
+
+/// What a package declares under `disclosures`: identifiers it decided on,
+/// printed as written. Open on purpose — a repository and its extensions
+/// outlive any vocabulary this tool would fix.
+fn disclosures(
+    package: &str,
+    table: &serde_json::Map<String, Value>,
+) -> Result<Vec<String>, Error> {
+    let Some(value) = table.get("disclosures") else {
+        return Ok(Vec::new());
+    };
+    let list = value.as_array().ok_or_else(|| {
+        Error::Disclosures(package.to_owned(), "must be a list of strings".to_owned())
+    })?;
+    if list.len() > DISCLOSURES_MAX {
+        return Err(Error::Disclosures(
+            package.to_owned(),
+            format!("may name at most {DISCLOSURES_MAX}"),
+        ));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let text = item.as_str().ok_or_else(|| {
+            Error::Disclosures(package.to_owned(), "must be a list of strings".to_owned())
+        })?;
+        if text.is_empty() || text.len() > DISCLOSURE_MAX || text.chars().any(char::is_control) {
+            return Err(Error::Disclosures(
+                package.to_owned(),
+                format!("{text:?} isn't 1..={DISCLOSURE_MAX} printable characters"),
+            ));
+        }
+        out.push(text.to_owned());
+    }
+    Ok(out)
 }
 
 /// Builds `package` for `target`; its output is shown if it fails.

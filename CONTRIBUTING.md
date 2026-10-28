@@ -18,7 +18,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-A new extension is a crate in `extensions/` that declares itself for the index (`[package.metadata.vrc-we] index = true`, and `mature = true` for one that isn't for everyone), so `cargo run -p index` finds it from cargo's own metadata rather than a list someone keeps by hand.
+A new extension is a crate in `extensions/` that declares itself for the index (`[package.metadata.vrc-we] index = true`, and `disclosures = [ … ]` for what it can do that its grants do not say), so `cargo run -p index` finds it from cargo's own metadata rather than a list someone keeps by hand.
 
 The client hosts these modules; its own checks stay the boundary, so an extension is written to the SDK's contract and not around it. A change to that contract — an event, a command, a variant or a field a module built earlier would not read — bumps `BOUNDARY_VERSION`. New fields carry `#[serde(default)]` instead.
 

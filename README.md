@@ -87,8 +87,10 @@ An extension joins the index by declaring itself in its own `Cargo.toml`. Nothin
 ```toml
 [package.metadata.vrc-we]
 index = true
-mature = false
+disclosures = ["account"]
 ```
+
+`disclosures` is the author's own list: what the extension can do that the manifest's grants do not already say (`device_control` for one that drives hardware on your network, `account` for one that needs an account with a service it connects to, or any identifier you choose). The client prints each one as written — its own sentence for those two, your words for anything else — beside the extension's details before it installs, and summarises a repository's set when the repository is added.
 
 `cargo run -p index -- --name official --out dist` writes `dist/index.json` and copies each module beside it, hashed. Its `min_boundary` is the SDK's `BOUNDARY_VERSION`, so a client refuses an extension built for a boundary it does not have.
 
