@@ -30,6 +30,12 @@ An extension reaches the index by passing the rules in [POLICY.md](POLICY.md):
 it builds from source, names its author and licence, declares its disclosures
 and its grants, and links the terms its users accept.
 
+## Releases
+
+A tag names one version for the whole workspace, and the release checks every
+listed extension against it. Changing one extension's version bumps the
+workspace and every module with it, so the set moves together.
+
 ## Commit messages
 
 `Area: what changed (why)`, several items joined with ` + `.
