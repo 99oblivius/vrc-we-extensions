@@ -101,4 +101,4 @@ does not mean, and what the store sees of it: [POLICY.md](POLICY.md).
 
 ## Status
 
-CI runs format, clippy, tests, a wasm build and an index. The tag-driven release publishes them. `v1.0.0` carries the `vrc-we-extensions` index with the camera and Twitch.
+CI runs format, clippy, tests, a wasm build and an index. The tag-driven release publishes them. `v1.1.0` carries the `vrc-we-extensions` index with the camera and Twitch.

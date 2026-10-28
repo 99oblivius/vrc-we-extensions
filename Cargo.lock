@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "camera"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "glam",
  "serde",
@@ -80,7 +80,7 @@ checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
 
 [[package]]
 name = "index"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde_json",
  "sha2",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "template"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "vrc-we-sdk",
 ]
@@ -244,7 +244,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vrc-we-sdk"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "serde",
