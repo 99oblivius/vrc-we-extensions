@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The tool builds every crate it lists for the target the workspace
       # states, so this is also the "does a module build" check.
-      - run: cargo run -p index --locked -- --name official --out dist
+      - run: cargo run -p index --locked -- --name vrc-we-extensions --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: index

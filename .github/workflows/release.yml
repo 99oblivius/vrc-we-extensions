@@ -20,7 +20,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo run -p index --locked -- --name official --out dist
+      - run: cargo run -p index --locked -- --name vrc-we-extensions --out dist
       # What the release is, checked as one thing: the tag is the version of
       # every module it ships, and every module is the size and hash the
       # index promises.
@@ -31,7 +31,7 @@ jobs:
           dist = pathlib.Path("dist")
           index = json.loads((dist / "index.json").read_text())
           assert index["format"] == 1, index["format"]
-          assert index["name"] == "official", index["name"]
+          assert index["name"] == "vrc-we-extensions", index["name"]
           assert index["extensions"], "an index of nothing"
           tag = os.environ["GITHUB_REF_NAME"]
           for entry in index["extensions"]:
