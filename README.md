@@ -94,6 +94,11 @@ disclosures = ["account"]
 
 `cargo run -p index -- --name vrc-we-extensions --out dist` writes `dist/index.json` and copies each module beside it, hashed. Its `min_boundary` is the SDK's `BOUNDARY_VERSION`, so a client refuses an extension built for a boundary it does not have.
 
+## Listing policy
+
+What may be listed here, what an extension must declare, what listing does and
+does not mean, and what the store sees of it: [POLICY.md](POLICY.md).
+
 ## Status
 
 CI runs format, clippy, tests, a wasm build and an index. The tag-driven release publishes them. `v1.0.0` carries the `vrc-we-extensions` index with the camera and Twitch.

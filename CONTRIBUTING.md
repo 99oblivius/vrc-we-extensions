@@ -24,6 +24,12 @@ The client hosts these modules; its own checks stay the boundary, so an extensio
 
 An extension's own tests run in this workspace; a change to the camera or the template keeps `cargo test --workspace` green.
 
+## Inclusion
+
+An extension reaches the index by passing the rules in [POLICY.md](POLICY.md):
+it builds from source, names its author and licence, declares its disclosures
+and its grants, and links the terms its users accept.
+
 ## Commit messages
 
 `Area: what changed (why)`, several items joined with ` + `.
