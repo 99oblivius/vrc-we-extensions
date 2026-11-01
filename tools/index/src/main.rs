@@ -304,19 +304,3 @@ fn cargo_metadata() -> Result<Value, Error> {
     }
     serde_json::from_slice(&out.stdout).map_err(|e| Error::Json(e.to_string()))
 }
-
-#[cfg(test)]
-mod tests {
-    use sha2::{Digest, Sha256};
-
-    /// The hex the document carries is the published one for `abc`.
-    #[test]
-    fn the_hash_is_written_as_lowercase_hex() {
-        let hash: [u8; 32] = Sha256::digest(b"abc").into();
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            hex,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-}

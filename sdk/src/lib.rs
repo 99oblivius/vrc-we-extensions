@@ -1021,6 +1021,8 @@ mod tests {
             "com1",
             "LPT9",
             "a.b",
+            "../escape",
+            "a/b",
             "",
             &"k".repeat(65),
         ] {
@@ -1057,14 +1059,6 @@ mod tests {
         m.pages[0].id = "two words".into();
         assert!(matches!(m.validate(), Err(ManifestError::BadName(_))));
         assert!(manifest(ns()).has_page("main"));
-    }
-
-    #[test]
-    fn store_keys_are_short_identifiers() {
-        assert!(is_store_key("sequence"));
-        assert!(!is_store_key("../escape"));
-        assert!(!is_store_key("a/b"));
-        assert!(!is_store_key(&"k".repeat(65)));
     }
 
     #[test]
