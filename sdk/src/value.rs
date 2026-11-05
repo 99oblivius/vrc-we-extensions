@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 /// A Wex value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    /// No value: what an omitted optional argument, a field never
+    /// published, or a read that found nothing arrives as.
     None,
     Bool(bool),
     Number(f64),
@@ -43,7 +45,9 @@ impl Value {
 /// [`DEPTH_MAX`] and [`VALUES_MAX`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Shape {
-    /// Nothing: a method's result only.
+    /// No value: a method's result when it returns nothing, or a signal's
+    /// payload when it carries none. A field or a parameter never has this
+    /// shape; an optional argument left out arrives as [`Value::None`].
     None,
     Bool,
     Number(Option<Range>),

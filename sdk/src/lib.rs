@@ -185,19 +185,48 @@ mod tests {
                 number("level", true, Some(Range::new(0.0, 1.0))),
                 number("seen", false, None),
             ],
-            methods: vec![Method {
-                name: "nudge".into(),
-                params: vec![Param {
-                    name: "by".into(),
-                    shape: Shape::Number(Some(Range::new(-2.0, 2.0))),
-                    options: None,
-                    optional: false,
-                }],
-                returns: Shape::None,
-                moves: vec!["level".into()],
-                coroutine: false,
-                contacts: false,
-            }],
+            methods: vec![
+                Method {
+                    name: "nudge".into(),
+                    params: vec![Param {
+                        name: "by".into(),
+                        shape: Shape::Number(Some(Range::new(-2.0, 2.0))),
+                        options: None,
+                        optional: false,
+                    }],
+                    returns: Shape::None,
+                    moves: vec!["level".into()],
+                    coroutine: false,
+                    contacts: false,
+                },
+                Method {
+                    name: "post".into(),
+                    params: vec![
+                        Param {
+                            name: "to".into(),
+                            shape: Shape::Text { max: 8 },
+                            options: None,
+                            optional: false,
+                        },
+                        Param {
+                            name: "body".into(),
+                            shape: Shape::Text { max: 8 },
+                            options: None,
+                            optional: true,
+                        },
+                        Param {
+                            name: "tag".into(),
+                            shape: Shape::Number(None),
+                            options: None,
+                            optional: true,
+                        },
+                    ],
+                    returns: Shape::None,
+                    moves: Vec::new(),
+                    coroutine: false,
+                    contacts: false,
+                },
+            ],
             signals: vec![Signal {
                 name: "bumped".into(),
                 label: "Bumped".into(),
@@ -262,6 +291,25 @@ mod tests {
     #[test]
     fn a_sound_manifest_validates() {
         assert_eq!(manifest(ns()).validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_optional_parameter_must_follow_every_required_one() {
+        let mut n = ns();
+        let post = n.methods.iter_mut().find(|m| m.name == "post").unwrap();
+        post.params.rotate_left(1);
+        let err = manifest(n).validate().unwrap_err();
+        assert_eq!(
+            err,
+            ManifestError::RequiredAfterOptional {
+                method: "post".into(),
+                param: "to".into(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "post declares a required parameter \"to\" after an optional one"
+        );
     }
 
     #[test]
@@ -1105,7 +1153,7 @@ mod tests {
         assert!(matches!(
             n.check_call("nudge", vec![]),
             Err(CheckError::Arity {
-                expected: 1,
+                arity: Arity { min: 1, max: 1 },
                 got: 0,
                 ..
             })
@@ -1118,6 +1166,113 @@ mod tests {
             n.check_call("poke", vec![]),
             Err(CheckError::UnknownMethod("poke".into()))
         );
+    }
+
+    #[test]
+    fn too_few_arguments_name_the_accepted_range() {
+        let n = ns();
+        let err = n.check_call("post", vec![]).unwrap_err();
+        assert_eq!(err.to_string(), "post takes 1 to 3 arguments, not 0");
+        let err = n.check_call("nudge", vec![]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "nudge takes 1 argument, not 0",
+            "an exact arity keeps its exact wording"
+        );
+    }
+
+    #[test]
+    fn a_call_may_leave_out_trailing_optional_arguments() {
+        let n = ns();
+        let to = Value::Text("amy".into());
+        assert_eq!(
+            n.check_call("post", vec![to.clone()]),
+            Ok(vec![to.clone(), Value::None, Value::None])
+        );
+        assert_eq!(
+            n.check_call("post", vec![to.clone(), Value::Text(String::new())]),
+            Ok(vec![to.clone(), Value::Text(String::new()), Value::None]),
+            "an empty value supplied is text, not an omission"
+        );
+        assert_eq!(
+            n.check_call(
+                "post",
+                vec![to.clone(), Value::Text("hi".into()), Value::Number(2.0)]
+            ),
+            Ok(vec![
+                to.clone(),
+                Value::Text("hi".into()),
+                Value::Number(2.0)
+            ])
+        );
+        assert!(matches!(
+            n.check_call("post", vec![]),
+            Err(CheckError::Arity {
+                arity: Arity { min: 1, max: 3 },
+                got: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            n.check_call(
+                "post",
+                vec![
+                    to.clone(),
+                    Value::Text("hi".into()),
+                    Value::Number(2.0),
+                    Value::None
+                ]
+            ),
+            Err(CheckError::Arity {
+                arity: Arity { min: 1, max: 3 },
+                got: 4,
+                ..
+            })
+        ));
+        assert!(matches!(
+            n.check_call("post", vec![Value::Number(1.0)]),
+            Err(CheckError::Type { .. })
+        ));
+    }
+
+    #[test]
+    fn a_call_may_leave_out_every_optional_argument() {
+        let mut n = ns();
+        n.methods.push(Method {
+            name: "paint".into(),
+            params: vec![
+                Param {
+                    name: "colour".into(),
+                    shape: Shape::Text { max: 8 },
+                    options: None,
+                    optional: true,
+                },
+                Param {
+                    name: "alpha".into(),
+                    shape: Shape::Number(Some(Range::new(0.0, 1.0))),
+                    options: None,
+                    optional: true,
+                },
+            ],
+            returns: Shape::None,
+            moves: Vec::new(),
+            coroutine: false,
+            contacts: false,
+        });
+        assert_eq!(
+            n.check_call("paint", vec![]),
+            Ok(vec![Value::None, Value::None]),
+            "every optional argument is padded, not only the last"
+        );
+    }
+
+    #[test]
+    fn a_checked_call_passes_the_check_again() {
+        let n = ns();
+        let once = n
+            .check_call("post", vec![Value::Text("amy".into())])
+            .expect("a call with its optional left out");
+        assert_eq!(n.check_call("post", once.clone()), Ok(once));
     }
 
     #[test]

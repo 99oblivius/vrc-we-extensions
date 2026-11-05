@@ -14,6 +14,8 @@ pub enum ManifestError {
     Untyped(String),
     #[error("\"{0}\" has an empty range or tuple, or exceeds the client's limits")]
     BadShape(String),
+    #[error("{method} declares a required parameter \"{param}\" after an optional one")]
+    RequiredAfterOptional { method: String, param: String },
     #[error("{method} moves \"{field}\", which isn't a writable field")]
     MovesUnknown { method: String, field: String },
     #[error("\"{0}\" isn't an OSC prefix it may use")]
@@ -57,10 +59,10 @@ pub enum CheckError {
     ReadOnly(String),
     #[error("no method \"{0}\"")]
     UnknownMethod(String),
-    #[error("{method} takes {expected} arguments, not {got}")]
+    #[error("{method} takes {arity} argument{}, not {got}", .arity.plural())]
     Arity {
         method: String,
-        expected: usize,
+        arity: Arity,
         got: usize,
     },
     #[error("\"{name}\" takes {expected:?}, not {got:?}")]
@@ -81,6 +83,55 @@ pub enum CheckError {
         expected: usize,
         got: usize,
     },
+}
+
+/// The argument counts a call accepts: every count from `min` through
+/// `max`. Optional parameters form a trailing suffix, so a count never
+/// leaves a required parameter for the client to fill in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arity {
+    pub min: usize,
+    pub max: usize,
+}
+
+impl Arity {
+    /// Whether a call passing `args` arguments fits.
+    pub fn accepts(self, args: usize) -> bool {
+        (self.min..=self.max).contains(&args)
+    }
+
+    /// What a count's noun ends in: only exactly one is singular.
+    pub fn plural(self) -> &'static str {
+        if (self.min, self.max) == (1, 1) {
+            ""
+        } else {
+            "s"
+        }
+    }
+}
+
+impl std::fmt::Display for Arity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.min == self.max {
+            write!(f, "{}", self.max)
+        } else {
+            write!(f, "{} to {}", self.min, self.max)
+        }
+    }
+}
+
+impl Method {
+    /// The argument counts a call of it accepts. Only trailing optional
+    /// parameters may be left out, so a required one after an optional one
+    /// is never filled in on the caller's behalf.
+    pub fn arity(&self) -> Arity {
+        let max = self.params.len();
+        let trailing = self.params.iter().rev().take_while(|p| p.optional).count();
+        Arity {
+            min: max - trailing,
+            max,
+        }
+    }
 }
 
 /// A Wex identifier: a letter or `_`, then letters, digits or `_`.
@@ -345,6 +396,7 @@ impl Namespace {
         }
         for m in &self.methods {
             let mut params: Vec<&str> = Vec::new();
+            let mut optional = false;
             for p in &m.params {
                 if !is_ident(&p.name) {
                     return Err(ManifestError::BadName(p.name.clone()));
@@ -354,6 +406,13 @@ impl Namespace {
                 }
                 params.push(&p.name);
                 check_shape(&p.name, &p.shape)?;
+                if !p.optional && optional {
+                    return Err(ManifestError::RequiredAfterOptional {
+                        method: m.name.clone(),
+                        param: p.name.clone(),
+                    });
+                }
+                optional |= p.optional;
             }
             let leaves = m.params.iter().map(|p| p.shape.leaves()).sum::<usize>();
             if leaves > VALUES_MAX {
@@ -436,23 +495,33 @@ impl Namespace {
     }
 
     /// The arguments a call of `method` delivers: typed, finite and clamped.
+    /// Trailing optional arguments left out arrive as `Value::None`, and an
+    /// optional argument passed as `Value::None` stays one, so a checked
+    /// call checks again unchanged.
     pub fn check_call(&self, method: &str, args: Vec<Value>) -> Result<Vec<Value>, CheckError> {
         let m = self
             .methods
             .iter()
             .find(|m| m.name == method)
             .ok_or_else(|| CheckError::UnknownMethod(method.to_owned()))?;
-        if args.len() != m.params.len() {
+        let arity = m.arity();
+        if !arity.accepts(args.len()) {
             return Err(CheckError::Arity {
                 method: method.to_owned(),
-                expected: m.params.len(),
+                arity,
                 got: args.len(),
             });
         }
-        m.params
+        let mut checked: Vec<Value> = m
+            .params
             .iter()
             .zip(args)
-            .map(|(p, v)| p.shape.check(&p.name, v))
-            .collect()
+            .map(|(p, v)| match v {
+                Value::None if p.optional => Ok(Value::None),
+                v => p.shape.check(&p.name, v),
+            })
+            .collect::<Result<_, _>>()?;
+        checked.resize(m.params.len(), Value::None);
+        Ok(checked)
     }
 }

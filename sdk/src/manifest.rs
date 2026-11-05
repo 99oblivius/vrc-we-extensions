@@ -240,9 +240,14 @@ pub struct Param {
     /// with a mapping, the client asks for the item's data
     /// ([`Event::Resolve`]), which this parameter then receives.
     pub options: Option<String>,
-    /// The person may leave it empty: the form says so, and the method
-    /// receives `Value::Text("")` (or `none`), which a module reads as "not
-    /// given". For an argument the API itself treats as optional.
+    /// The argument is optional. Optional parameters form a trailing
+    /// suffix. A manifest with a required parameter after an optional one
+    /// fails validation. A call may pass any count from the number of required
+    /// parameters through the declared total. A trailing optional argument
+    /// left out arrives as [`Value::None`], which a module reads as "not
+    /// given". An empty text passed for a text parameter stays
+    /// `Value::Text("")`, so omission and an explicit empty value stay
+    /// distinct. The action's form labels an optional parameter so.
     #[serde(default)]
     pub optional: bool,
 }
