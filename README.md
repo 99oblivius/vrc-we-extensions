@@ -67,7 +67,7 @@ A change to the boundary, such as a new event, command, variant or field that an
 
 ## Licences
 
-The SDK is Apache-2.0 ([`sdk/LICENSE`](sdk/LICENSE)). The template is MIT with its own copy ([`template/LICENSE`](template/LICENSE)), since it leaves this repository when copied. The extensions here are MIT ([`LICENSE`](LICENSE)). Every built extension embeds the SDK, so each release carries the Apache-2.0 text too, and the client shows an extension's licences.
+The SDK is Apache-2.0 ([`sdk/LICENSE`](sdk/LICENSE)). The template is MIT with its own copy ([`template/LICENSE`](template/LICENSE)), since it leaves this repository when copied. The extensions here are MIT ([`LICENSE`](LICENSE)). Every built extension embeds the SDK and what it depends on, so each release carries `LICENSE`, `LICENSE-SDK` and `THIRD-PARTY-NOTICES.txt` beside its modules, and the client shows an extension's licence in its details. A dependency change regenerates the notices in the same commit: `cargo about generate --locked --fail about.hbs --workspace -o THIRD-PARTY-NOTICES.txt`.
 
 ## Releases
 
@@ -102,4 +102,4 @@ does not mean, and what the store sees of it: [POLICY.md](POLICY.md).
 
 ## Status
 
-CI runs format, clippy, tests, a wasm build and an index. The tag-driven release publishes them. `v1.1.0` carries the `vrc-we-extensions` index with the camera and Twitch.
+CI runs format, clippy, tests, a wasm build and an index. The tag-driven release publishes them. A tag names one version for the whole workspace.

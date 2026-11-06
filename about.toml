@@ -1,0 +1,12 @@
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+targets = ["wasm32-unknown-unknown"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+private = { ignore = true }

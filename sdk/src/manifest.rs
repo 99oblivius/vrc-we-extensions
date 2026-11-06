@@ -85,9 +85,11 @@ pub const DESCRIPTION_MAX: usize = 1024;
 /// The longest documentation address a manifest may carry, in bytes.
 pub const DOCUMENTATION_MAX: usize = 2048;
 
-/// An extension's own terms: what the person accepts before installing it.
-/// The text travels inline when it is short, and is fetched from `url`
-/// otherwise; `sha256` is what the client checks what it shows against.
+/// An extension's own terms, or those of a service it uses: what the person
+/// accepts before installing it. The text travels inline when it is short, and
+/// `url` otherwise says where it is published, which the client links to and
+/// never fetches. An acceptance holds to what is declared, so an update asks
+/// again when `sha256`, the text, or with neither of those the address, changes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Terms {
     /// What they are called, in the author's words.
@@ -98,7 +100,8 @@ pub struct Terms {
     /// The text, when it is short enough to travel with the module.
     #[serde(default)]
     pub inline: String,
-    /// SHA-256 of the text, lowercase hex.
+    /// SHA-256 of the text, lowercase hex: checked against inline text, and
+    /// for text published at `url` the author's way to say that it changed.
     #[serde(default)]
     pub sha256: String,
 }
