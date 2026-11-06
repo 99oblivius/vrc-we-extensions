@@ -27,7 +27,8 @@ pub enum Event {
     /// stored.
     Loaded { key: String, value: Option<String> },
     /// What [`Command::LoadSecret`] found in slot `slot`; none when nothing
-    /// was stored or the client has no keyring to read.
+    /// was stored, when the slot was not declared or Settings switched it
+    /// off, or when the client has no keyring to read.
     SecretLoaded { slot: String, value: Option<String> },
     /// The person closed window `id`.
     WindowClosed { id: String },

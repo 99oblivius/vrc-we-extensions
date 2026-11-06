@@ -137,12 +137,12 @@ pub enum Endpoint {
     Udp { host: String, port: u16 },
 }
 
-/// The most bytes one [`Event::Received`] of a TCP stream carries, and the
+/// The most bytes one [`Event::Received`](crate::Event::Received) of a TCP stream carries, and the
 /// largest UDP datagram.
 pub const NET_CHUNK_MAX: usize = 64 * 1024;
 
 /// The bit set in the ids the client gives accepted connections
-/// ([`Event::Accepted`]); an extension's own ids leave it clear.
+/// ([`Event::Accepted`](crate::Event::Accepted)); an extension's own ids leave it clear.
 pub const ACCEPTED_ID: u64 = 1 << 63;
 
 /// What crosses a connection or an HTTP body: text, or bytes (base64 in
