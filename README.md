@@ -28,6 +28,7 @@ The client runs it in [wasmi](https://github.com/wasmi-labs/wasmi). Fuel meterin
 | Extension | What it does | Read |
 |---|---|---|
 | `camera` | VRChat's user camera as `@CAMERA`: pose, moves and turns, tracks and positions, its settings, a page and an editor modal. | [`extensions/camera/README.md`](extensions/camera/README.md) |
+| `intiface` | Devices as `@INTIFACE`, through a local Intiface server: timed drives, a limit you set, and stopping that doesn't rest on one mechanism. | [README](extensions/intiface/README.md) |
 | `twitch` | Twitch as `@TWITCH`: chat, redemptions, subs, cheers, raids, hype trains, follows, polls and live state over EventSub, plus seven send actions. | [`extensions/twitch/README.md`](extensions/twitch/README.md) |
 
 Each extension README describes its surface, its files, and how to build and test it. This page grows by one row per extension and nothing else.

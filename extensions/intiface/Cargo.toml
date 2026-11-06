@@ -1,0 +1,23 @@
+[package]
+name = "intiface"
+authors = ["oblivius"]
+description = "Drives the devices Intiface has connected, from mappings and scripts"
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage = "https://github.com/99oblivius/vrc-we-extensions/blob/main/extensions/intiface/README.md"
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# It goes in the repository's index.
+[package.metadata.vrc-we]
+index = true
+disclosures = ["device_control"]
+
+[dependencies]
+vrc-we-sdk = { workspace = true }
+serde_json = { workspace = true }

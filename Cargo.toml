@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sdk", "template", "extensions/camera", "extensions/twitch", "tools/index"]
+members = ["sdk", "template", "extensions/camera", "extensions/intiface", "extensions/twitch", "tools/index"]
 
 [workspace.package]
 version = "1.1.0"
