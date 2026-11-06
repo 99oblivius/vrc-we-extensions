@@ -20,7 +20,7 @@ pub(crate) fn build() -> Manifest {
     let number = Shape::Number(None);
     Manifest {
         name: "twitch".into(),
-        author: "oblivius".into(),
+        author: vrc_we_sdk::cargo_authors(env!("CARGO_PKG_AUTHORS")),
         version: env!("CARGO_PKG_VERSION").into(),
         namespace: Some(Namespace {
             name: "TWITCH".into(),

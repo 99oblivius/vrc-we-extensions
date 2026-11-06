@@ -74,6 +74,12 @@ pub struct Manifest {
     pub license: String,
 }
 
+/// `env!("CARGO_PKG_AUTHORS")` in the form a repository's index lists it, so a
+/// manifest and its listing say the same: the client refuses one that differs.
+pub fn cargo_authors(authors: &str) -> String {
+    authors.replace(':', ", ")
+}
+
 /// The longest description a manifest may carry, in bytes.
 pub const DESCRIPTION_MAX: usize = 1024;
 /// The longest documentation address a manifest may carry, in bytes.

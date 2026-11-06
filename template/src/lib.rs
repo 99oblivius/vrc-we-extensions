@@ -66,7 +66,7 @@ impl Extension for Template {
     fn manifest(&self) -> Manifest {
         Manifest {
             name: "template".into(),
-            author: "your name".into(),
+            author: vrc_we_sdk::cargo_authors(env!("CARGO_PKG_AUTHORS")),
             version: env!("CARGO_PKG_VERSION").into(),
             namespace: Some(Namespace {
                 name: "TEMPLATE".into(),

@@ -84,7 +84,7 @@ pub(crate) fn build() -> Manifest {
     let (at, facing) = (&["x", "y", "z"], &["pitch", "yaw", "roll"]);
     Manifest {
         name: "camera".to_owned(),
-        author: "oblivius".to_owned(),
+        author: vrc_we_sdk::cargo_authors(env!("CARGO_PKG_AUTHORS")),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         namespace: Some(Namespace {
             name: "CAMERA".to_owned(),

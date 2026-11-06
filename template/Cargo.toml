@@ -1,5 +1,6 @@
 [package]
 name = "template"
+authors = ["your name"]
 description = "Copy this directory to start an extension"
 license = "MIT"
 version.workspace = true
