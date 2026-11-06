@@ -48,7 +48,8 @@ pub struct Manifest {
     /// ([`icon_is_self_contained`]).
     #[serde(default)]
     pub icons: Vec<Icon>,
-    /// The terms it is provided under, shown before it installs.
+    /// The terms it is provided under, shown before it installs and in its
+    /// details afterwards.
     #[serde(default)]
     pub terms: Option<Terms>,
     /// It knows the contacts the person controls in a live session
@@ -56,7 +57,27 @@ pub struct Manifest {
     /// ([`Method::contacts`]) on their copy of it ([`Command::Fire`]).
     #[serde(default)]
     pub contacts: bool,
+    /// It shows a line in the client's status bar ([`Command::Status`]).
+    #[serde(default)]
+    pub status: bool,
+    /// What it does, for its details: at most [`DESCRIPTION_MAX`] bytes.
+    /// `env!("CARGO_PKG_DESCRIPTION")` keeps it the one its listing shows.
+    #[serde(default)]
+    pub description: String,
+    /// Where its documentation lives, an `https` address its details link
+    /// to. `env!("CARGO_PKG_HOMEPAGE")` declares it once.
+    #[serde(default)]
+    pub documentation: String,
+    /// The licence it is provided under, as `env!("CARGO_PKG_LICENSE")`
+    /// reads it.
+    #[serde(default)]
+    pub license: String,
 }
+
+/// The longest description a manifest may carry, in bytes.
+pub const DESCRIPTION_MAX: usize = 1024;
+/// The longest documentation address a manifest may carry, in bytes.
+pub const DOCUMENTATION_MAX: usize = 2048;
 
 /// An extension's own terms: what the person accepts before installing it.
 /// The text travels inline when it is short, and is fetched from `url`

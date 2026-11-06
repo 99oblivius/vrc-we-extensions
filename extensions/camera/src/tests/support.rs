@@ -180,6 +180,7 @@ pub(super) fn texts(node: &Node, into: &mut Vec<String>) {
     match node {
         Node::Column(items) | Node::Row(items) => items.iter().for_each(|n| texts(n, into)),
         Node::Heading(t) | Node::Text(t) => into.push(t.clone()),
+        Node::Status(status) => into.push(status.label.clone()),
         Node::Link { label, url } => into.push(format!("{label} -> {url}")),
         Node::Number { id, value, .. } | Node::Slider { id, value, .. } => {
             into.push(format!("{id}={value:?}"))

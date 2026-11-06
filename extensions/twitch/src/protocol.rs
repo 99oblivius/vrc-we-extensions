@@ -24,6 +24,7 @@ pub const ANNOUNCE_URL: &str = "https://api.twitch.tv/helix/chat/announcements";
 pub const CHANNELS_URL: &str = "https://api.twitch.tv/helix/channels";
 pub const COMMERCIAL_URL: &str = "https://api.twitch.tv/helix/channels/commercial";
 pub const POLLS_URL: &str = "https://api.twitch.tv/helix/polls";
+pub const STREAMS_URL: &str = "https://api.twitch.tv/helix/streams";
 
 /// The clip's length: Twitch's default, 30 s of the 90 s it keeps.
 pub const CLIP_SECONDS: f32 = 30.0;
@@ -69,21 +70,6 @@ pub const GROUPS: [Group; 9] = [
 ];
 
 impl Group {
-    /// Its store key and the page's node id.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Redeems => "redeems",
-            Self::Chat => "chat",
-            Self::Subs => "subs",
-            Self::Cheer => "cheer",
-            Self::Raid => "raid",
-            Self::Hype => "hype",
-            Self::Follow => "follow",
-            Self::Live => "live",
-            Self::Poll => "poll",
-        }
-    }
-
     /// The signals its events are sent under; a group whose events differ in
     /// kind has one each, so a mapping names the thing it cares about.
     pub fn signals(self) -> &'static [&'static str] {
@@ -252,6 +238,18 @@ pub fn refresh_body(client_id: &str, refresh: &str) -> String {
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh),
     ])
+}
+
+/// `GET /helix/streams` for one broadcaster.
+pub fn streams_url(broadcaster: &str) -> String {
+    format!("{STREAMS_URL}?user_id={}", encode(broadcaster))
+}
+
+/// Whether `GET /helix/streams` found the stream: it lists only live ones.
+pub fn parse_stream_live(body: &Value) -> bool {
+    body.get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|streams| !streams.is_empty())
 }
 
 /// `PATCH /helix/channels` for one broadcaster.
@@ -428,11 +426,23 @@ pub fn parse_error(body: &Value) -> Option<String> {
 /// What an EventSub frame is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
-    Welcome { session: String, keepalive_ms: u64 },
+    Welcome {
+        session: String,
+        keepalive_ms: u64,
+    },
     Keepalive,
-    Notification { kind: String, event: Value },
-    Reconnect { url: String },
-    Revocation { kind: String, status: String },
+    Notification {
+        id: String,
+        kind: String,
+        event: Value,
+    },
+    Reconnect {
+        url: String,
+    },
+    Revocation {
+        kind: String,
+        status: String,
+    },
     Other(String),
 }
 
@@ -484,6 +494,12 @@ pub fn parse_frame(text: &str) -> Result<Frame, String> {
                 .to_owned(),
         },
         "notification" => Frame::Notification {
+            id: frame
+                .get("metadata")
+                .and_then(|m| m.get("message_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             kind: frame
                 .get("metadata")
                 .and_then(|m| m.get("subscription_type"))
@@ -520,8 +536,6 @@ pub struct Fact {
     pub status: String,
     pub winner: String,
     pub votes: f64,
-    /// A stream's own state, from `stream.online` and `stream.offline`.
-    pub live: bool,
 }
 
 fn text(event: &Value, key: &str) -> String {
@@ -560,10 +574,6 @@ pub fn decode(kind: &str, event: &Value) -> Option<Fact> {
                 .get("reward")
                 .map(|r| text(r, "title"))
                 .unwrap_or_default();
-            fact.progress = event
-                .get("reward")
-                .map(|r| number(r, "cost"))
-                .unwrap_or(0.0);
         }
         "channel.subscribe" => {
             fact.user = text(event, "user_name");
@@ -602,8 +612,7 @@ pub fn decode(kind: &str, event: &Value) -> Option<Fact> {
             // v2 renamed the totals; keep the one that is there.
             fact.bits = number(event, "total");
         }
-        "stream.online" => fact.live = true,
-        "stream.offline" => fact.live = false,
+        "stream.online" | "stream.offline" => {}
         "channel.poll.begin" | "channel.poll.progress" | "channel.poll.end" => {
             fact.title = text(event, "title");
             fact.status = text(event, "status");
@@ -750,7 +759,6 @@ mod tests {
         assert_eq!(fact.user, "Cooler_User");
         assert_eq!(fact.reward, "Dance");
         assert_eq!(fact.input, "pogchamp");
-        assert_eq!(fact.progress, 100.0, "the reward's cost");
     }
 
     #[test]

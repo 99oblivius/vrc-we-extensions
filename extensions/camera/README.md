@@ -8,13 +8,13 @@ It is the large worked example: everything an extension can declare except secre
 
 | Part | What |
 |---|---|
-| namespace | `@CAMERA`: fields `pose`, `mode` and the pads' speeds, the methods below, and one signal, `play_ended` |
+| namespace | `@CAMERA`: fields `pose`, `mode`, the settings sliders and toggles, the methods below, and one signal, `play_ended` |
 | OSC | reads and writes `/usercamera/` only |
 | page | `camera`: the pads, capture, mode, the settings sliders and toggles |
 | modal | the editor: a 3D view of the path, a timeline of keys, the track library |
 | actions | 12, from Capture and Play track to the four moves and turns |
 | conditions | one, on `mode` |
-| store | its library of tracks and positions, as JSON under one key |
+| store | its library of tracks and positions, as JSON: an index, and each track's steps under its own key |
 
 ## Methods
 

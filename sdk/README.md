@@ -29,6 +29,8 @@ client                                   module (wasm32-unknown-unknown)
 | `pages`, `actions`, `conditions` | its right-panel page, the actions a mapping offers, the conditions a rule can hold to |
 | `secrets` | the keyring slots it may keep, by name |
 | `notifies` | it may post notifications |
+| `status` | it may show a line in the status bar |
+| `description`, `documentation`, `license` | what its details show; `env!("CARGO_PKG_DESCRIPTION")`, `_HOMEPAGE` and `_LICENSE` declare them once |
 | `network` | the hosts, ports and protocols it may reach, and what it may listen on |
 | `log_prefixes` | the game-log lines it may read, which name players |
 | `contacts` | it knows the contacts the person controls and may fire its contact methods on their copy |
@@ -42,7 +44,7 @@ Every count and size has a constant in this crate, and the client enforces it:
 
 | Constant | Value | Bounds |
 |---|---|---|
-| `BOUNDARY_VERSION` | 2 | the boundary this SDK speaks |
+| `BOUNDARY_VERSION` | 3 | the boundary this SDK speaks |
 | `TEXT_MAX` / `LIST_MAX` / `VALUES_MAX` | 4 KiB / 1024 / 16384 | a value, a list, one call's values |
 | `FIELDS_MAX` / `METHODS_MAX` / `SIGNALS_MAX` / `PARAMS_MAX` | 256 / 256 / 64 / 16 | a namespace |
 | `ICONS_MAX` / `ICON_MAX` | 64 / 8 KiB | packaged SVGs |
@@ -56,7 +58,7 @@ The client's sandbox adds what a module cannot lift: a memory cap, fuel slices b
 
 ## Versioning
 
-`BOUNDARY_VERSION` rises when a change could break a module built earlier, such as a removed field or a changed meaning. New fields carry `#[serde(default)]` and leave it alone, so a module built at 1 still loads at 2.
+`BOUNDARY_VERSION` rises when a change could break a module built earlier, such as a removed field or a changed meaning. A manifest field raises it too, since an older client would store the manifest without it and refuse its own record once updated. Other new fields carry `#[serde(default)]` and leave it alone. A module built at any boundary from `MIN_BOUNDARY` up still loads.
 
 A repository's index states the oldest boundary it needs (`min_boundary`). The client refuses an extension newer than it can run, naming both.
 

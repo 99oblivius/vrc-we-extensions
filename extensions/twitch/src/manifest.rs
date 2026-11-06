@@ -12,6 +12,9 @@ use crate::protocol;
 use crate::protocol::GROUPS;
 use crate::{PAGE, SECRET_AUTH, SECRET_REFRESH};
 
+/// Twitch's Glitch, one colour, which the client draws in its theme's.
+const LOGO_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714Z"/></svg>"#;
+
 pub(crate) fn build() -> Manifest {
     let text = |max: usize| Shape::Text { max };
     let number = Shape::Number(None);
@@ -271,12 +274,19 @@ pub(crate) fn build() -> Manifest {
         ],
         log_prefixes: Vec::new(),
         contacts: false,
-        icons: Vec::new(),
+        icons: vec![vrc_we_sdk::Icon {
+            name: crate::page::LOGO.into(),
+            svg: LOGO_SVG.into(),
+        }],
         terms: Some(vrc_we_sdk::Terms {
             label: "Twitch terms of service".into(),
             url: "https://www.twitch.tv/p/legal/terms-of-service/".into(),
             ..vrc_we_sdk::Terms::default()
         }),
+        status: true,
+        description: env!("CARGO_PKG_DESCRIPTION").into(),
+        documentation: env!("CARGO_PKG_HOMEPAGE").into(),
+        license: env!("CARGO_PKG_LICENSE").into(),
     }
 }
 

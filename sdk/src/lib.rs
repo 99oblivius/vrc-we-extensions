@@ -49,8 +49,10 @@ pub trait Extension {
 
 /// The boundary version this SDK speaks, which a module built against it
 /// reports. An event, a command, a variant or a field a module built
-/// earlier would not read bumps it.
-pub const BOUNDARY_VERSION: u32 = 2;
+/// earlier would not read bumps it. So does a manifest field: an older client
+/// would store the manifest without it, then refuse its own record once
+/// updated, since a load compares the two.
+pub const BOUNDARY_VERSION: u32 = 3;
 
 /// The oldest boundary version the client loads. It rises only to drop
 /// support.
@@ -263,7 +265,56 @@ mod tests {
             icons: Vec::new(),
             terms: None,
             contacts: false,
+            status: false,
+            description: String::new(),
+            documentation: String::new(),
+            license: String::new(),
         }
+    }
+
+    #[test]
+    fn its_details_are_optional_and_held_to_what_the_client_shows() {
+        let with = |set: fn(&mut Manifest)| {
+            let mut m = manifest(ns());
+            set(&mut m);
+            m.validate()
+        };
+        assert_eq!(with(|_| {}), Ok(()), "none is required");
+        assert_eq!(
+            with(|m| m.documentation = "https://example.org/docs".into()),
+            Ok(())
+        );
+        assert_eq!(
+            with(|m| m.documentation = "http://example.org/docs".into()),
+            Err(ManifestError::BadDetail("documentation")),
+            "a link the client wouldn't open"
+        );
+        assert_eq!(
+            with(|m| m.description = "x".repeat(DESCRIPTION_MAX + 1)),
+            Err(ManifestError::BadDetail("description"))
+        );
+        assert_eq!(
+            with(|m| m.license = "x\ny".into()),
+            Err(ManifestError::BadDetail("license"))
+        );
+    }
+
+    #[test]
+    fn a_status_crosses_serialized_and_a_view_holds_it_to_a_label() {
+        let status = Status {
+            tone: Tone::Waiting,
+            label: "Waiting".into(),
+            icon: Some("logo".into()),
+        };
+        let command = Command::Status(Some(status.clone()));
+        let text = serde_json::to_string(&command).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&text).unwrap(), command);
+        assert!(Node::Status(status.clone()).fits());
+        let long = Status {
+            label: "x".repeat(65),
+            ..status
+        };
+        assert!(!Node::Status(long).fits(), "a status is one short line");
     }
 
     #[test]

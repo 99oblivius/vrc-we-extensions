@@ -62,7 +62,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-A change to the boundary, such as a new event, command, variant or field that an older module would not read, bumps `BOUNDARY_VERSION` in the SDK. New fields carry `#[serde(default)]` and leave it alone.
+A change to the boundary, such as a new event, command, variant or field that an older module would not read, bumps `BOUNDARY_VERSION` in the SDK. So does a manifest field, since an older client would store the manifest without it and refuse its own record once updated. Other new fields carry `#[serde(default)]` and leave it alone.
 
 ## Licences
 

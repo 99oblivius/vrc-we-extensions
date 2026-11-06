@@ -181,6 +181,9 @@ pub enum Command {
         body: String,
         seconds: u32,
     },
+    /// Its line in the client's status bar, none to take it away, if the
+    /// manifest says it shows one. The latest wins.
+    Status(Option<Status>),
 }
 
 /// The longest a notification stays up, in seconds.

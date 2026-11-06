@@ -133,6 +133,13 @@ impl Extension for Template {
             //     ..Terms::default()
             // }),
             terms: None,
+            // A line in the client's status bar (`Command::Status`).
+            status: false,
+            // Set in Cargo.toml, which the repository's listing reads too. Its
+            // homepage is where the extension's details link to.
+            description: env!("CARGO_PKG_DESCRIPTION").into(),
+            documentation: env!("CARGO_PKG_HOMEPAGE").into(),
+            license: env!("CARGO_PKG_LICENSE").into(),
         }
     }
 

@@ -14,6 +14,8 @@ pub enum ManifestError {
     Untyped(String),
     #[error("\"{0}\" has an empty range or tuple, or exceeds the client's limits")]
     BadShape(String),
+    #[error("its {0} is too long or unreadable, or its address isn't https")]
+    BadDetail(&'static str),
     #[error("{method} declares a required parameter \"{param}\" after an optional one")]
     RequiredAfterOptional { method: String, param: String },
     #[error("{method} moves \"{field}\", which isn't a writable field")]
@@ -233,6 +235,17 @@ impl Manifest {
             if !usable {
                 return Err(ManifestError::BadTerms(t.label.clone()));
             }
+        }
+        if !self.description.is_empty() && !is_text_label(&self.description, DESCRIPTION_MAX) {
+            return Err(ManifestError::BadDetail("description"));
+        }
+        let documented = self.documentation.starts_with("https://")
+            && is_text_label(&self.documentation, DOCUMENTATION_MAX);
+        if !self.documentation.is_empty() && !documented {
+            return Err(ManifestError::BadDetail("documentation"));
+        }
+        if !self.license.is_empty() && !is_label(&self.license) {
+            return Err(ManifestError::BadDetail("license"));
         }
         let mut labels: Vec<&str> = Vec::new();
         for a in &self.actions {

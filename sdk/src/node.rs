@@ -5,6 +5,34 @@ use crate::*;
 
 use serde::{Deserialize, Serialize};
 
+/// How a status reads. The extension names a meaning and the client picks
+/// the colour, as it does for everything else it draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tone {
+    /// Working as asked.
+    Good,
+    /// On its way, or held up by something that may clear.
+    Waiting,
+    /// Failed until someone acts.
+    Bad,
+    /// Nothing is asked of it.
+    Idle,
+}
+
+/// One line of state: an icon, a dot in its tone, and a label. A view shows
+/// it as [`Node::Status`], and the client's status bar as [`Command::Status`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    pub tone: Tone,
+    /// What it says ([`is_label`]).
+    pub label: String,
+    /// One of the manifest's icons, drawn first. In the status bar, a status
+    /// without one is prefixed with the extension's name, so it always says
+    /// whose it is.
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
 /// A view: a tree of client widgets the client renders, themes and
 /// focus-walks. The extension describes; it never draws.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -13,6 +41,8 @@ pub enum Node {
     Row(Vec<Node>),
     Heading(String),
     Text(String),
+    /// A line of state, in the client's status colours.
+    Status(Status),
     /// A link the person presses: the client opens `url` in the browser.
     /// Only `https` reaches the window.
     Link {
@@ -322,6 +352,7 @@ impl Node {
                     && (!log || *min > 0.0)
             }
             Node::HoldButton { key, .. } => key.is_none_or(Key::bindable),
+            Node::Status(status) => is_label(&status.label),
             _ => true,
         };
         let texts = self.texts();
@@ -387,6 +418,11 @@ impl Node {
                 vec![id, icon, tip]
             }
             Node::Heading(t) | Node::Text(t) => vec![t],
+            Node::Status(status) => [&status.label]
+                .into_iter()
+                .chain(&status.icon)
+                .map(String::as_str)
+                .collect(),
             Node::Link { label, url } => vec![label, url],
             Node::Button {
                 id, label, icon, ..

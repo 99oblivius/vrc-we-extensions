@@ -17,9 +17,16 @@
 //! asks `/oauth2/device` for a code, the page shows the verification address,
 //! the module polls `/oauth2/token` at the interval Twitch gave, and the
 //! answer is stored and checked. The renewal timer is armed a minute before
-//! the access token's life ends. The socket subscribes what the client says
-//! its rules read. The action that met the 401 is repeated once: Twitch
-//! refused it before doing anything, so repeating it is not doing it twice.
+//! the access token's life ends. The action that met the 401 is repeated once:
+//! Twitch refused it before doing anything, so repeating it is not doing it
+//! twice.
+//!
+//! Every event is one step, then one reconcile of what is wanted against what
+//! exists, then one publish of what changed. A socket opens only while the
+//! client's rules read something it can subscribe, since Twitch closes one
+//! with no subscription after ten seconds. `connected` is true once the socket
+//! is welcomed and everything wanted is active; anything short of that shows
+//! as waiting, with what it is waiting for.
 //!
 //! Build: `cargo wasm -p twitch`.
 
@@ -27,13 +34,14 @@ mod manifest;
 mod page;
 mod protocol;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use vrc_we_sdk::{
-    Command, Data, Endpoint, Event, Extension, Header, Manifest, Shape, UiEvent, Value,
+    Command, Data, Endpoint, Event, Extension, Header, Manifest, Node, Shape, Status, UiEvent,
+    Value,
 };
 
-use page::Status;
+use page::{Events, Snapshot};
 use protocol::{Frame, Group, Identity, Token, GROUPS};
 use serde_json::Value as Json;
 
@@ -61,8 +69,17 @@ const CLIENT_ID: &str = "awyzerbycsfre9z9rsox3q0wlpnn9r";
 
 /// How long before a token's expiry it is renewed.
 const REFRESH_LEAD_MS: u64 = 60_000;
-/// How long to wait before reconnecting a socket that dropped.
+/// The shortest and the longest wait before asking Twitch again.
 const RETRY_MS: u32 = 5_000;
+const RETRY_MAX_MS: u32 = 300_000;
+/// How long a new socket has to be welcomed.
+const WELCOME_MS: u32 = 30_000;
+/// Creates out at once. The full surface is 16, and the host allows 16 requests
+/// and sockets in all (`NET_OPEN_MAX`): this leaves room for two sockets and
+/// the actions a mapping sends.
+const SUB_WINDOW: usize = 4;
+/// Notifications remembered, to count one delivered twice once.
+const SEEN_MAX: usize = 64;
 /// What a mapping's poll runs for, within Twitch's bounds.
 const POLL_SECONDS: u64 = 300;
 const POLL_MIN_SECONDS: u64 = 15;
@@ -90,6 +107,15 @@ impl Group {
     }
 }
 
+/// `text` cut to at most `max` bytes, on a character's edge.
+fn at_most(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// The signal one event is sent under, and what it carries: the value a
 /// mapping matches, since the signal's name already says what happened.
 fn signal_of(fact: &protocol::Fact) -> Option<(&'static str, Value)> {
@@ -100,7 +126,7 @@ fn signal_of(fact: &protocol::Fact) -> Option<(&'static str, Value)> {
         }
         "channel.chat.message" => (
             "chatted",
-            Value::Text(fact.message.chars().take(64).collect()),
+            Value::Text(at_most(&fact.message, 64).to_owned()),
         ),
         "channel.subscribe" | "channel.subscription.message" => {
             ("subscribed", Value::Number(fact.tier))
@@ -151,20 +177,24 @@ impl Watched {
                 "message" => {
                     want(Group::Chat, &mut out);
                     want(Group::Cheer, &mut out);
+                    want(Group::Subs, &mut out);
                 }
                 "reward" | "input" => want(Group::Redeems, &mut out),
                 "bits" => {
+                    want(Group::Chat, &mut out);
                     want(Group::Cheer, &mut out);
                     want(Group::Hype, &mut out);
                 }
                 "tier" | "months" => want(Group::Subs, &mut out),
                 "viewers" => want(Group::Raid, &mut out),
                 "hype_level" | "hype_progress" | "hype_goal" => want(Group::Hype, &mut out),
-                "live" => want(Group::Live, &mut out),
+                // `connected` holds a socket open, which needs one subscription,
+                // and this is the group that needs no scope.
+                "live" | "connected" => want(Group::Live, &mut out),
                 "poll_title" | "poll_status" | "poll_winner" | "poll_votes" => {
                     want(Group::Poll, &mut out)
                 }
-                // `connected`, `user` and `error` are its own state: no event.
+                // `user` and `error` are its own state: no event.
                 _ => {}
             }
         }
@@ -173,29 +203,44 @@ impl Watched {
     }
 }
 
-/// What the module is doing, as the page reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Phase {
-    /// No token held.
-    Off,
-    /// A token is held and the socket is being opened.
-    Connecting,
-    /// The socket is up and its session subscribed.
-    Live { session: String },
+/// Whether the held token can be used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Login {
+    /// No token is held, or none could be read: nothing is forgotten by it.
+    #[default]
+    Out,
+    /// A token is being read or checked.
+    Checking,
+    /// Checked: `identity` names its account.
+    In,
+    /// Twitch refused it and its renewal.
+    Expired,
 }
 
-/// A request that is out, and what its answer is for.
-#[derive(Debug, Clone, PartialEq)]
-enum Pending {
-    Validate,
-    Refresh,
-    /// Asking Twitch for a device code.
-    Device,
-    /// Asking whether the person has approved it yet.
-    DeviceToken,
-    Subscribe {
-        group: Group,
-    },
+/// One subscription this session wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Sub {
+    Queued,
+    /// Its create is out.
+    Sent,
+    /// Twitch answered 202, or that it already exists.
+    Active,
+    /// Twitch was busy or unreachable: it goes again after a wait.
+    Retrying,
+    /// Twitch said no, which holds until Reconnect or a new token.
+    Refused(String),
+}
+
+/// A socket, and its session once Twitch welcomed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Socket {
+    id: u64,
+    session: Option<String>,
+}
+
+/// An action a mapping can send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
     Chat,
     Clip,
     Marker,
@@ -205,56 +250,117 @@ enum Pending {
     Poll,
 }
 
-/// An action's request, kept so a renewal can repeat it once: a 401 means
+impl Action {
+    /// What a refusal calls it, and the scope it needs.
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Chat => ("chat", SCOPE_CHAT),
+            Self::Clip => ("clip", SCOPE_CLIP),
+            Self::Marker => ("marker", SCOPE_BROADCAST),
+            Self::Announce => ("announcement", SCOPE_ANNOUNCE),
+            Self::Title => ("title", SCOPE_BROADCAST),
+            Self::Commercial => ("commercial", SCOPE_COMMERCIAL),
+            Self::Poll => ("poll", SCOPE_POLLS),
+        }
+    }
+}
+
+/// A request as asked, kept so a renewal can repeat it once: a 401 means
 /// Twitch did not do the work, so repeating it is not doing it twice.
 #[derive(Debug, Clone, PartialEq)]
-struct Retry {
+struct Request {
     method: String,
     url: String,
     content: Option<(&'static str, String)>,
-    pending: Pending,
+}
+
+/// A request that is out, and what its answer is for. Dropping one is how an
+/// answer the host can't cancel is ignored: it finds nothing here.
+#[derive(Debug, Clone, PartialEq)]
+enum Pending {
+    Validate,
+    Refresh,
+    /// Asking Twitch for a device code.
+    Device,
+    /// Asking whether the person has approved it yet.
+    DeviceToken,
+    Subscribe {
+        kind: String,
+    },
+    /// Whether the stream is live right now.
+    Stream,
+    Action {
+        action: Action,
+        request: Request,
+        retried: bool,
+    },
 }
 
 #[derive(Default)]
 pub struct Twitch {
-    phase: Option<Phase>,
+    login: Login,
+    /// The account the token was last checked to be: it outlives a keyring
+    /// that can't be read, and only Forget removes it.
     identity: Option<Identity>,
     /// What the client's rules and scripts read of it: the whole of what it
     /// listens for.
     watched: Watched,
-    /// The groups this session subscribed; it only ever grows, since Twitch
-    /// retires a session's subscriptions when its socket closes.
-    subscribed: Vec<Group>,
+    /// The subscriptions what is watched needs and the token's scopes allow.
+    wanted: Vec<(Group, String)>,
+    /// Groups the token's scopes can't subscribe, and the scope each needs.
+    missing: Vec<(Group, &'static str)>,
+    /// This session's subscriptions by type. It only ever grows while the
+    /// socket lives, since Twitch retires a session's subscriptions with it
+    /// and a wear changes what is watched often.
+    subs: BTreeMap<String, Sub>,
+    /// A 401 on a create already renewed the token: another is a refusal.
+    subs_renewed: bool,
+    /// How long the next wait for a create is.
+    sub_backoff_ms: u32,
+    ws: Option<Socket>,
+    /// The socket a requested reconnect opened, until its welcome.
+    next_ws: Option<u64>,
+    keepalive_ms: u64,
+    /// How long the next wait before a socket opens is; none is the shortest.
+    backoff_ms: u32,
+    retry_armed: bool,
+    /// The renewal is being read or is out.
+    refreshing: bool,
+    /// Requests a renewal interrupted, each repeated once when it lands.
+    waiting: Vec<(Action, Request)>,
+    /// A device code has been asked for and Twitch hasn't answered.
+    device_asked: bool,
+    /// The sign-in that is waiting on the person: Twitch's code, the address
+    /// to approve at, and how often to ask.
+    device: Option<protocol::DeviceCode>,
+    /// The stream's own state, kept across events of other kinds.
+    stream_live: bool,
+    /// This session has read the stream's state already.
+    stream_asked: bool,
+    /// The last notifications' ids: Twitch delivers at least once, and both
+    /// sockets may carry one during a reconnect.
+    seen: VecDeque<String>,
     last: Option<protocol::Fact>,
     error: Option<String>,
     pending: HashMap<u64, Pending>,
     next_id: u64,
-    ws: Option<u64>,
-    /// The socket a reconnect_url opened, closed once the new session is up.
-    old_ws: Option<u64>,
-    keepalive_ms: u64,
-    /// The sign-in that is waiting on the person: Twitch's code, the address
-    /// to approve at, and how often to ask.
-    device: Option<protocol::DeviceCode>,
-    /// Groups the token's scopes can't subscribe, and the scope each needs.
-    missing: Vec<(Group, &'static str)>,
-    /// The action request that is out, if one is.
-    action: Option<Retry>,
-    /// The action a renewal interrupted, to repeat once the new token is in.
-    retry: Option<Retry>,
-    /// The action out is that repeat: a second refusal is reported, not
-    /// renewed again.
-    retrying: bool,
+    /// What was last published, so an event that changes nothing costs nothing.
+    published: HashMap<&'static str, Value>,
+    shown_page: Option<Node>,
+    shown_status: Option<Status>,
 }
 
 impl Twitch {
-    fn phase(&self) -> &Phase {
-        self.phase.as_ref().unwrap_or(&Phase::Off)
-    }
-
     /// The client the held token was issued to: every Helix call names it.
     fn client_id(&self) -> Option<&str> {
         self.identity.as_ref().map(|i| i.client_id.as_str())
+    }
+
+    /// The account an action speaks for, while the token may still be good.
+    fn account(&self) -> Option<Identity> {
+        self.identity
+            .clone()
+            .filter(|_| matches!(self.login, Login::In | Login::Checking))
     }
 
     /// Every scope this build may ever ask for, so a rule added later does not
@@ -280,26 +386,17 @@ impl Twitch {
     /// polls and an address the person opens, code included. No redirect, no
     /// secret, nothing typed.
     fn start_device(&mut self, out: &mut Vec<Command>) {
-        if self.device.is_some() {
+        if self.device.is_some() || self.device_asked {
             return;
         }
-        self.next_id += 1;
-        let id = self.next_id;
-        out.push(Command::Http {
-            id,
-            method: "POST".into(),
-            url: protocol::DEVICE_URL.into(),
-            headers: vec![(
-                "Content-Type".to_owned(),
-                Header::Text("application/x-www-form-urlencoded".to_owned()),
-            )],
-            body: Some(Data::Text(protocol::device_body(
-                CLIENT_ID,
-                &Self::scopes(),
-            ))),
-        });
-        self.pending.insert(id, Pending::Device);
+        self.device_asked = true;
         self.error = None;
+        self.form(
+            out,
+            protocol::DEVICE_URL,
+            protocol::device_body(CLIENT_ID, &Self::scopes()),
+            Pending::Device,
+        );
     }
 
     /// Asks whether the person has approved the waiting code yet.
@@ -307,34 +404,39 @@ impl Twitch {
         let Some(code) = self.device.as_ref().map(|d| d.code.clone()) else {
             return;
         };
+        self.form(
+            out,
+            protocol::TOKEN_URL,
+            protocol::device_token_body(CLIENT_ID, &Self::scopes(), &code),
+            Pending::DeviceToken,
+        );
+    }
+
+    /// A form-encoded POST that carries no token.
+    fn form(&mut self, out: &mut Vec<Command>, url: &str, body: String, pending: Pending) {
         self.next_id += 1;
         let id = self.next_id;
         out.push(Command::Http {
             id,
             method: "POST".into(),
-            url: protocol::TOKEN_URL.into(),
+            url: url.into(),
             headers: vec![(
                 "Content-Type".to_owned(),
                 Header::Text("application/x-www-form-urlencoded".to_owned()),
             )],
-            body: Some(Data::Text(protocol::device_token_body(
-                CLIENT_ID,
-                &Self::scopes(),
-                &code,
-            ))),
+            body: Some(Data::Text(body)),
         });
-        self.pending.insert(id, Pending::DeviceToken);
+        self.pending.insert(id, pending);
     }
 
-    /// The sign-in was cancelled or expired: stop asking.
+    /// The sign-in was cancelled or expired: stop asking, and what is out
+    /// finds nothing when it answers.
     fn cancel_device(&mut self, out: &mut Vec<Command>) {
         self.device = None;
-        out.push(Command::CancelTimer {
-            id: "device-poll".into(),
-        });
-        out.push(Command::CancelTimer {
-            id: "device-expire".into(),
-        });
+        self.device_asked = false;
+        self.pending
+            .retain(|_, p| !matches!(p, Pending::Device | Pending::DeviceToken));
+        cancel(out, &["device-poll", "device-expire"]);
     }
 
     /// Asks `method url` with the token's client id, the bearer when `auth`,
@@ -360,18 +462,10 @@ impl Twitch {
                 Header::Secret(SECRET_AUTH.to_owned()),
             ));
         }
-        let body = content.clone().map(|(kind, body)| {
+        let body = content.map(|(kind, body)| {
             headers.push(("Content-Type".to_owned(), Header::Text(kind.to_owned())));
             Data::Text(body)
         });
-        if is_action(&pending) {
-            self.action = Some(Retry {
-                method: method.to_owned(),
-                url: url.to_owned(),
-                content: content.clone(),
-                pending: pending.clone(),
-            });
-        }
         out.push(Command::Http {
             id,
             method: method.to_owned(),
@@ -380,6 +474,48 @@ impl Twitch {
             body,
         });
         self.pending.insert(id, pending);
+    }
+
+    /// Sends an action, keeping what a renewal needs to repeat it.
+    fn act(
+        &mut self,
+        out: &mut Vec<Command>,
+        action: Action,
+        method: &str,
+        url: &str,
+        content: Option<(&'static str, String)>,
+    ) {
+        self.send_action(
+            out,
+            action,
+            Request {
+                method: method.to_owned(),
+                url: url.to_owned(),
+                content,
+            },
+            false,
+        );
+    }
+
+    fn send_action(
+        &mut self,
+        out: &mut Vec<Command>,
+        action: Action,
+        request: Request,
+        retried: bool,
+    ) {
+        self.request(
+            out,
+            &request.method.clone(),
+            &request.url.clone(),
+            true,
+            request.content.clone(),
+            Pending::Action {
+                action,
+                request,
+                retried,
+            },
+        );
     }
 
     /// Asks what the held token is: the client it was issued to, the account,
@@ -400,124 +536,180 @@ impl Twitch {
         self.pending.insert(id, Pending::Validate);
     }
 
-    /// Opens the EventSub socket.
+    /// Opens the EventSub socket. A welcome that never comes counts as the
+    /// socket lost.
     fn connect(&mut self, out: &mut Vec<Command>) {
         self.next_id += 1;
         let id = self.next_id;
-        self.ws = Some(id);
-        self.phase = Some(Phase::Connecting);
+        self.ws = Some(Socket { id, session: None });
         out.push(Command::Open {
             id,
             to: Endpoint::Ws {
                 url: protocol::WS_URL.to_owned(),
             },
         });
+        out.push(Command::Timer {
+            id: "watchdog".into(),
+            after_ms: WELCOME_MS,
+        });
     }
 
-    /// Reads the token the last answer carried: keeps it, and gets the account
-    /// it belongs to.
-    fn accepted(&mut self, out: &mut Vec<Command>, token: Token) {
-        self.store_token(out, &token);
-        // A renewal answers with the token's own scopes: the held identity
-        // follows them, so a group that came into scope starts listening.
-        if let Some(identity) = self.identity.as_mut() {
-            identity.scopes = token.scopes.clone();
-        }
+    /// The socket is gone without a reconnect to replace it. What it held is
+    /// gone with it, what Twitch refused stays refused, and another opens
+    /// after a wait that grows until one holds.
+    fn lost_socket(&mut self, out: &mut Vec<Command>) {
+        self.forget_session(out);
+        let wait = self.backoff_ms.max(RETRY_MS);
+        self.backoff_ms = wait.saturating_mul(2).min(RETRY_MAX_MS);
+        self.retry_armed = true;
         out.push(Command::Timer {
-            id: "refresh".into(),
-            after_ms: token.expires_ms.saturating_sub(REFRESH_LEAD_MS) as u32,
+            id: "retry".into(),
+            after_ms: wait,
         });
-        // The action the renewal interrupted goes again, once, with the new
-        // token: Twitch refused it before doing anything.
-        if let Some(retry) = self.retry.take() {
-            self.retrying = true;
-            self.request(
-                out,
-                &retry.method,
-                &retry.url,
-                true,
-                retry.content,
-                retry.pending,
-            );
+    }
+
+    fn forget_session(&mut self, out: &mut Vec<Command>) {
+        self.subs.retain(|_, s| matches!(s, Sub::Refused(_)));
+        self.pending
+            .retain(|_, p| !matches!(p, Pending::Subscribe { .. } | Pending::Stream));
+        self.stream_asked = false;
+        cancel(out, &["watchdog", "sub-retry"]);
+    }
+
+    /// Closes every socket and forgets everything they held.
+    fn drop_link(&mut self, out: &mut Vec<Command>) {
+        for id in self
+            .ws
+            .take()
+            .map(|w| w.id)
+            .into_iter()
+            .chain(self.next_ws.take())
+        {
+            out.push(Command::Close { id });
         }
-        // A renewal while live changes nothing the socket is holding: its
-        // subscriptions were made with the token that is still valid.
-        if matches!(self.phase(), Phase::Live { .. }) || self.identity.is_none() {
+        self.forget_session(out);
+        self.subs.clear();
+        self.subs_renewed = false;
+        self.backoff_ms = 0;
+        self.sub_backoff_ms = 0;
+        self.retry_armed = false;
+        cancel(out, &["retry"]);
+    }
+
+    /// Brings what exists in line with what is wanted, after every event: the
+    /// socket opens when something can be subscribed, never otherwise, since
+    /// Twitch closes one with no subscription after ten seconds.
+    fn reconcile(&mut self, out: &mut Vec<Command>) {
+        self.wanted.clear();
+        self.missing.clear();
+        if self.login != Login::In {
             return;
         }
-        self.connect(out);
-    }
-
-    fn store_token(&self, out: &mut Vec<Command>, token: &Token) {
-        out.push(Command::StoreSecret {
-            slot: SECRET_AUTH.into(),
-            value: format!("Bearer {}", token.access),
-        });
-        if let Some(refresh) = &token.refresh {
-            out.push(Command::StoreSecret {
-                slot: SECRET_REFRESH.into(),
-                value: refresh.clone(),
-            });
-        }
-    }
-
-    /// Subscribes the groups the watched set needs and this session doesn't
-    /// have. Twitch retires a session's subscriptions when its socket closes,
-    /// so nothing is ever deleted here; the set only grows while connected.
-    fn subscribe(&mut self, out: &mut Vec<Command>) {
         let Some(identity) = self.identity.clone() else {
             return;
         };
-        let want: Vec<Group> = self
-            .watched
-            .groups()
-            .into_iter()
-            .filter(|g| !self.subscribed.contains(g))
-            .collect();
-        self.missing.clear();
-        for group in want {
-            if let Some(scope) = group.scope() {
-                if !identity.scopes.iter().any(|s| s == scope) {
-                    self.missing.push((group, scope));
-                    continue;
-                }
+        let groups = self.watched.groups();
+        let mut creates = Vec::new();
+        for &group in &groups {
+            if let Some(scope) = group
+                .scope()
+                .filter(|scope| !identity.scopes.iter().any(|held| held == scope))
+            {
+                self.missing.push((group, scope));
+                continue;
             }
-            self.subscribed.push(group);
             for (kind, version, condition) in group.subscriptions(&identity.id) {
-                let session = self.session();
-                let body = serde_json::json!({
-                    "type": kind,
-                    "version": version.to_string(),
-                    "condition": condition,
-                    "transport": { "method": "websocket", "session_id": session }
-                })
-                .to_string();
-                self.request(
-                    out,
-                    "POST",
-                    protocol::SUBSCRIPTIONS_URL,
-                    true,
-                    Some(("application/json", body)),
-                    Pending::Subscribe { group },
-                );
+                self.wanted.push((group, kind.to_owned()));
+                self.subs.entry(kind.to_owned()).or_insert(Sub::Queued);
+                creates.push((kind, version, condition));
             }
         }
-    }
-
-    fn session(&self) -> String {
-        match self.phase() {
-            Phase::Live { session } => session.clone(),
-            _ => String::new(),
+        let usable = self
+            .wanted
+            .iter()
+            .any(|(_, kind)| !matches!(self.subs[kind], Sub::Refused(_)));
+        if usable && self.ws.is_none() && self.next_ws.is_none() && !self.retry_armed {
+            self.connect(out);
+        }
+        let Some(session) = self.ws.as_ref().and_then(|w| w.session.clone()) else {
+            return;
+        };
+        if groups.contains(&Group::Live) && !self.stream_asked {
+            self.stream_asked = true;
+            let url = protocol::streams_url(&identity.id);
+            self.request(out, "GET", &url, true, None, Pending::Stream);
+        }
+        // A create sent now would carry the token being replaced.
+        if self.refreshing {
+            return;
+        }
+        let sent = self.subs.values().filter(|s| **s == Sub::Sent).count();
+        let mut room = SUB_WINDOW.saturating_sub(sent);
+        for (kind, version, condition) in creates {
+            if room == 0 {
+                break;
+            }
+            if self.subs[kind] != Sub::Queued {
+                continue;
+            }
+            room -= 1;
+            self.subs.insert(kind.to_owned(), Sub::Sent);
+            let body = serde_json::json!({
+                "type": kind,
+                "version": version.to_string(),
+                "condition": condition,
+                "transport": { "method": "websocket", "session_id": session }
+            })
+            .to_string();
+            self.request(
+                out,
+                "POST",
+                protocol::SUBSCRIPTIONS_URL,
+                true,
+                Some(("application/json", body)),
+                Pending::Subscribe {
+                    kind: kind.to_owned(),
+                },
+            );
         }
     }
 
-    /// Publishes what the module is, as fields and the page.
-    fn publish(&self) -> Vec<Command> {
+    /// What the socket and its subscriptions come to.
+    fn events(&self) -> Events {
+        let active = |kind: &String| self.subs.get(kind) == Some(&Sub::Active);
+        let nothing_wanted = self.wanted.is_empty() && self.missing.is_empty();
+        if self.ws.as_ref().is_some_and(|w| w.session.is_some()) {
+            if !self.subs.values().any(|s| *s == Sub::Active) && nothing_wanted {
+                return Events::Idle;
+            }
+            let all = self.missing.is_empty() && self.wanted.iter().all(|(_, k)| active(k));
+            return match all {
+                true => Events::Connected,
+                false => Events::Waiting,
+            };
+        }
+        if nothing_wanted {
+            return Events::Idle;
+        }
+        let usable = self
+            .wanted
+            .iter()
+            .any(|(_, kind)| !matches!(self.subs.get(kind), Some(Sub::Refused(_))));
+        match usable {
+            true => Events::Connecting,
+            false => Events::Waiting,
+        }
+    }
+
+    /// Publishes what changed since the last publish, of what the module is.
+    fn publish(&mut self, events: Events, out: &mut Vec<Command>) {
         let fact = self.last.clone().unwrap_or_default();
-        let live = matches!(self.phase(), Phase::Live { .. });
         let mut fields = vec![
-            ("connected", Value::Bool(live)),
-            ("live", Value::Bool(fact.live)),
+            (
+                "connected",
+                Value::Bool(self.login == Login::In && events == Events::Connected),
+            ),
+            ("live", Value::Bool(self.stream_live)),
             (
                 "user",
                 Value::Text(
@@ -549,29 +741,74 @@ impl Twitch {
         ] {
             fields.push((name, Value::Number(value)));
         }
-        let mut out: Vec<Command> = fields
-            .into_iter()
-            .map(|(name, value)| Command::Field {
-                name: name.to_owned(),
-                value,
-            })
-            .collect();
-        let groups = self.watched.groups();
-        let status = Status {
-            phase: self.phase(),
-            logged_in: self.identity.is_some(),
-            who: self.identity.as_ref().map_or("", |i| i.login.as_str()),
+        for (name, value) in fields {
+            if self.published.get(name) != Some(&value) {
+                self.published.insert(name, value.clone());
+                out.push(Command::Field {
+                    name: name.to_owned(),
+                    value,
+                });
+            }
+        }
+        let snapshot = self.snapshot(events);
+        let view = page::view(&snapshot);
+        let status = page::bar(&snapshot);
+        if self.shown_page.as_ref() != Some(&view) {
+            self.shown_page = Some(view.clone());
+            out.push(Command::Page {
+                page: PAGE.into(),
+                view,
+            });
+        }
+        if self.shown_status.as_ref() != Some(&status) {
+            self.shown_status = Some(status.clone());
+            out.push(Command::Status(Some(status)));
+        }
+    }
+
+    /// What the page and the status bar read.
+    fn snapshot(&self, events: Events) -> Snapshot<'_> {
+        let state = |kind: &String| self.subs.get(kind);
+        let mut listening: Vec<Group> = Vec::new();
+        let mut refused: Vec<(Group, &str)> = Vec::new();
+        for (group, _) in &self.wanted {
+            let kinds = || self.wanted.iter().filter(|(g, _)| g == group);
+            if !listening.contains(group)
+                && kinds().all(|(_, kind)| state(kind) == Some(&Sub::Active))
+            {
+                listening.push(*group);
+            }
+            if let Some(why) = kinds().find_map(|(_, kind)| match state(kind) {
+                Some(Sub::Refused(why)) => Some(why.as_str()),
+                _ => None,
+            }) {
+                if !refused.iter().any(|(g, _)| g == group) {
+                    refused.push((*group, why));
+                }
+            }
+        }
+        let count = |wanted: fn(&Sub) -> bool| {
+            self.wanted
+                .iter()
+                .filter(|(_, kind)| state(kind).is_some_and(wanted))
+                .count()
+        };
+        Snapshot {
+            login: self.login,
+            events,
+            who: self.identity.as_ref().map(|i| i.login.as_str()),
             device: self.device.as_ref().map(|d| d.link.as_str()),
-            groups: &groups,
+            device_asked: self.device_asked,
+            listening,
+            refused,
+            active: count(|s| *s == Sub::Active),
+            total: self.wanted.len(),
+            busy: count(|s| *s == Sub::Retrying) > 0,
+            retry_armed: self.retry_armed,
             missing: &self.missing,
             last: self.last.as_ref(),
             error: self.error.as_deref(),
-        };
-        out.push(Command::Page {
-            page: PAGE.into(),
-            view: page::view(&status),
-        });
-        out
+        }
     }
 
     /// Answers an action that can't run now.
@@ -582,65 +819,49 @@ impl Twitch {
             value: Value::Bool(false),
         });
     }
-}
 
-/// Whether `pending` is an action's request: the ones a renewal may repeat.
-fn is_action(pending: &Pending) -> bool {
-    matches!(
-        pending,
-        Pending::Chat
-            | Pending::Clip
-            | Pending::Marker
-            | Pending::Announce
-            | Pending::Title
-            | Pending::Commercial
-            | Pending::Poll
-    )
-}
-
-/// The trigger editor's label for one of its signals.
-impl Extension for Twitch {
-    fn manifest(&self) -> Manifest {
-        crate::manifest::build()
-    }
-
-    fn handle(&mut self, event: Event) -> Vec<Command> {
-        let mut out = Vec::new();
+    /// One event, as the work it implies.
+    fn step(&mut self, event: Event, out: &mut Vec<Command>) {
         match event {
             Event::Start => {
+                self.login = Login::Checking;
                 // The identity first: a renewal needs the client id it holds,
                 // and it is read before the token is checked.
                 out.push(Command::Load {
                     key: K_IDENTITY.into(),
                 });
             }
-            Event::Loaded { key, value } => {
-                if key == K_IDENTITY {
-                    self.identity = value.and_then(|t| serde_json::from_str(&t).ok());
-                    out.push(Command::LoadSecret {
-                        slot: SECRET_AUTH.into(),
-                    });
-                }
-                out.extend(self.publish());
+            Event::Watched { fields, signals } => self.watched = Watched { fields, signals },
+            Event::Loaded { key, value } if key == K_IDENTITY => {
+                self.identity = value.and_then(|t| serde_json::from_str(&t).ok());
+                out.push(Command::LoadSecret {
+                    slot: SECRET_AUTH.into(),
+                });
             }
-            Event::SecretLoaded { slot, value } if slot == SECRET_AUTH => match value {
-                // A token is held: ask what it is, then open the socket.
-                Some(_) => self.validate(&mut out),
-                None => {
-                    self.phase = Some(Phase::Off);
-                    out.extend(self.publish());
+            Event::SecretLoaded { slot, value } if slot == SECRET_AUTH => {
+                if self.login != Login::Checking {
+                    return;
                 }
-            },
+                match value {
+                    // A token is held: ask what it is. None may be a keyring
+                    // that can't be read now, so nothing is forgotten.
+                    Some(_) => self.validate(out),
+                    None => self.login = Login::Out,
+                }
+            }
             Event::SecretLoaded { slot, value } if slot == SECRET_REFRESH => {
+                if !self.refreshing {
+                    return;
+                }
                 let (refresh, client) = match (value, self.client_id().map(str::to_owned)) {
                     (Some(refresh), Some(client)) => (refresh, client),
                     _ => {
-                        self.expired(&mut out);
-                        return out;
+                        self.expired(out, "Twitch refused the token: connect again.".into());
+                        return;
                     }
                 };
                 self.request(
-                    &mut out,
+                    out,
                     "POST",
                     protocol::TOKEN_URL,
                     false,
@@ -653,57 +874,70 @@ impl Extension for Twitch {
             }
             Event::Http { id, response } => {
                 if let Some(pending) = self.pending.remove(&id) {
-                    self.answered(&mut out, pending, response);
+                    self.answered(out, pending, response);
                 }
             }
-            Event::Opened { .. } => {}
-            Event::Received { data, .. } => {
+            Event::Received { id, data } => {
                 let Data::Text(text) = data else {
-                    return out;
+                    return;
                 };
                 match protocol::parse_frame(&text) {
-                    Ok(frame) => out.extend(self.frame(frame)),
+                    Ok(frame) => self.frame(id, frame, out),
                     Err(e) => self.error = Some(format!("bad frame: {e}")),
                 }
             }
-            Event::Closed { id, error } if Some(id) == self.ws || Some(id) == self.old_ws => {
-                self.ws = None;
-                self.old_ws = None;
+            Event::Closed { id, error } => {
+                if self.next_ws == Some(id) {
+                    self.next_ws = None;
+                    if self.ws.is_some() {
+                        return;
+                    }
+                } else if self.ws.as_ref().is_some_and(|w| w.id == id) {
+                    self.ws = None;
+                    if self.next_ws.is_some() {
+                        return;
+                    }
+                } else {
+                    return;
+                }
                 if let Some(why) = error {
                     self.error = Some(why);
                 }
-                if !matches!(self.phase(), Phase::Off) {
-                    self.phase = Some(Phase::Connecting);
-                    out.push(Command::Timer {
-                        id: "retry".into(),
-                        after_ms: RETRY_MS,
-                    });
-                }
+                self.lost_socket(out);
             }
-            Event::Closed { .. } => {}
             Event::Timer { id, .. } => match id.as_str() {
-                "device-poll" => self.poll_device(&mut out),
+                "device-poll" => self.poll_device(out),
                 "device-expire" => {
-                    self.cancel_device(&mut out);
+                    self.cancel_device(out);
                     self.error = Some("The sign-in expired: connect again.".into());
                 }
-                "after-token" => self.validate(&mut out),
-                "refresh" => self.refresh(&mut out),
-                "retry" => self.connect(&mut out),
+                "after-token" => self.validate(out),
+                "refresh" => self.refresh(out),
+                "retry" => self.retry_armed = false,
+                "sub-retry" => {
+                    for sub in self.subs.values_mut().filter(|s| **s == Sub::Retrying) {
+                        *sub = Sub::Queued;
+                    }
+                }
                 "watchdog" => {
                     // Nothing for two keepalives: the socket only looks open.
-                    if let Some(ws) = self.ws.take() {
-                        out.push(Command::Close { id: ws });
+                    if self.ws.is_none() && self.next_ws.is_none() {
+                        return;
                     }
-                    self.phase = Some(Phase::Connecting);
-                    out.push(Command::Timer {
-                        id: "retry".into(),
-                        after_ms: RETRY_MS,
-                    });
+                    for id in self
+                        .ws
+                        .take()
+                        .map(|w| w.id)
+                        .into_iter()
+                        .chain(self.next_ws.take())
+                    {
+                        out.push(Command::Close { id });
+                    }
+                    self.lost_socket(out);
                 }
                 _ => {}
             },
-            Event::Ui { event, .. } => out.extend(self.ui(event)),
+            Event::Ui { event, .. } => self.ui(event, out),
             Event::Call {
                 id,
                 ref method,
@@ -712,11 +946,8 @@ impl Extension for Twitch {
             } => out.extend(self.call(id, method, &args)),
             _ => {}
         }
-        out
     }
-}
 
-impl Twitch {
     /// What an answer to `pending` means.
     fn answered(
         &mut self,
@@ -724,20 +955,19 @@ impl Twitch {
         pending: Pending,
         response: Result<vrc_we_sdk::HttpResponse, String>,
     ) {
-        let (status, body) = match response {
-            Ok(r) => (
-                r.status,
-                match r.body {
+        let (status, parsed) = match response {
+            Ok(r) => {
+                let body = match r.body {
                     Data::Text(t) => t,
                     Data::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
-                },
-            ),
+                };
+                (r.status, serde_json::from_str(&body).unwrap_or(Json::Null))
+            }
             Err(e) => {
-                self.error = Some(e);
+                self.unreachable(out, pending, e);
                 return;
             }
         };
-        let parsed: Json = serde_json::from_str(&body).unwrap_or(Json::Null);
         match pending {
             Pending::Validate => match (status, protocol::parse_validate(&parsed)) {
                 (200, Ok(identity)) => {
@@ -751,22 +981,28 @@ impl Twitch {
                         value: serde_json::to_string(&identity).unwrap_or_default(),
                     });
                     self.identity = Some(identity);
+                    self.login = Login::In;
                     self.error = None;
-                    self.connect(out);
                 }
                 // The token is dead: renew it from what the identity and the
                 // refresh slot hold, or ask for a new one.
-                (401, _) => out.push(Command::LoadSecret {
-                    slot: SECRET_REFRESH.into(),
-                }),
-                (_, Err(e)) => self.error = Some(e),
-                _ => self.error = protocol::parse_error(&parsed),
+                (401, _) => self.refresh(out),
+                (_, Err(e)) => self.check_again(out, e),
+                _ => {
+                    let why = protocol::parse_error(&parsed)
+                        .unwrap_or_else(|| format!("the check failed ({status})"));
+                    self.check_again(out, why);
+                }
             },
             Pending::Refresh => match (status, protocol::parse_token(&parsed)) {
                 (200, Ok(token)) => {
-                    self.phase = Some(Phase::Connecting);
+                    self.refreshing = false;
                     self.error = None;
                     self.accepted(out, token);
+                }
+                (500.., _) => {
+                    let why = format!("the renewal failed ({status})");
+                    self.renew_again(out, why);
                 }
                 // Twitch refused the renewal itself (`invalid_grant` once the
                 // refresh token is spent, which a public client's is after 30
@@ -774,131 +1010,248 @@ impl Twitch {
                 _ => {
                     let why = protocol::parse_error(&parsed)
                         .unwrap_or_else(|| format!("the renewal was refused ({status})"));
-                    self.expired_with(out, why);
+                    self.expired(out, why);
                 }
             },
-            Pending::Device => match (status, protocol::parse_device(&parsed)) {
-                (200, Ok(device)) => {
-                    let (interval, expires) = (device.interval_ms, device.expires_ms);
-                    self.device = Some(device);
-                    self.error = None;
-                    out.push(Command::Timer {
-                        id: "device-poll".into(),
-                        after_ms: interval,
-                    });
-                    out.push(Command::Timer {
-                        id: "device-expire".into(),
-                        after_ms: expires,
-                    });
-                }
-                (_, Ok(_)) => {
-                    self.error = Some(
-                        protocol::parse_error(&parsed)
-                            .unwrap_or_else(|| format!("Twitch refused the sign-in ({status})")),
-                    );
-                }
-                (_, Err(e)) => self.error = Some(e),
-            },
-            Pending::DeviceToken => match status {
-                200 => match protocol::parse_token(&parsed) {
-                    Ok(token) => {
-                        self.cancel_device(out);
-                        self.store_token(out, &token);
-                        // The token is in the keyring now; a beat later the
-                        // check reads it and names the account.
-                        self.phase = Some(Phase::Connecting);
-                        self.identity = None;
+            Pending::Device => {
+                self.device_asked = false;
+                match (status, protocol::parse_device(&parsed)) {
+                    (200, Ok(device)) => {
+                        let (interval, expires) = (device.interval_ms, device.expires_ms);
+                        self.device = Some(device);
                         self.error = None;
                         out.push(Command::Timer {
-                            id: "after-token".into(),
-                            after_ms: 500,
-                        });
-                    }
-                    Err(e) => self.error = Some(e),
-                },
-                400 => {
-                    let why = parsed
-                        .get("message")
-                        .and_then(Json::as_str)
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    if why.contains("authorization_pending") {
-                        let wait = self.device.as_ref().map_or(5_000, |d| d.interval_ms);
-                        out.push(Command::Timer {
                             id: "device-poll".into(),
-                            after_ms: wait,
-                        });
-                    } else if why.contains("slow_down") {
-                        let wait = self.device.as_mut().map_or(10_000, |d| {
-                            d.interval_ms = d.interval_ms.saturating_add(5_000);
-                            d.interval_ms
+                            after_ms: interval,
                         });
                         out.push(Command::Timer {
-                            id: "device-poll".into(),
-                            after_ms: wait,
+                            id: "device-expire".into(),
+                            after_ms: expires,
                         });
-                    } else {
-                        let why = protocol::parse_error(&parsed)
-                            .unwrap_or_else(|| "the sign-in expired".to_owned());
-                        self.cancel_device(out);
-                        self.error = Some(why);
                     }
+                    (_, Ok(_)) => {
+                        self.error =
+                            Some(protocol::parse_error(&parsed).unwrap_or_else(|| {
+                                format!("Twitch refused the sign-in ({status})")
+                            }));
+                    }
+                    (_, Err(e)) => self.error = Some(e),
                 }
-                _ => {
-                    let why = protocol::parse_error(&parsed)
-                        .unwrap_or_else(|| format!("the sign-in was refused ({status})"));
+            }
+            Pending::DeviceToken => self.device_answered(out, status, &parsed),
+            Pending::Subscribe { kind } => {
+                let sub = match status {
+                    202 | 409 => {
+                        self.subs_renewed = false;
+                        Sub::Active
+                    }
+                    401 if !self.subs_renewed => {
+                        self.subs_renewed = true;
+                        self.refresh(out);
+                        Sub::Queued
+                    }
+                    429 | 500.. => self.retry_sub(out),
+                    _ => Sub::Refused(
+                        protocol::parse_error(&parsed)
+                            .unwrap_or_else(|| format!("answered {status}")),
+                    ),
+                };
+                if self.subs.contains_key(&kind) {
+                    self.subs.insert(kind, sub);
+                }
+            }
+            Pending::Stream => {
+                if status == 200 {
+                    self.stream_live = protocol::parse_stream_live(&parsed);
+                }
+            }
+            Pending::Action {
+                action,
+                request,
+                retried,
+            } => self.sent(out, status, &parsed, action, request, retried),
+        }
+    }
+
+    /// `pending` never reached Twitch.
+    fn unreachable(&mut self, out: &mut Vec<Command>, pending: Pending, why: String) {
+        match pending {
+            Pending::Validate => self.check_again(out, why),
+            Pending::Refresh => self.renew_again(out, why),
+            Pending::Subscribe { kind } => {
+                let sub = self.retry_sub(out);
+                if self.subs.contains_key(&kind) {
+                    self.subs.insert(kind, sub);
+                }
+                self.error = Some(why);
+            }
+            Pending::Device => {
+                self.device_asked = false;
+                self.error = Some(why);
+            }
+            // The next poll or the next session asks again.
+            Pending::DeviceToken => {
+                let wait = self.device.as_ref().map_or(5_000, |d| d.interval_ms);
+                out.push(Command::Timer {
+                    id: "device-poll".into(),
+                    after_ms: wait,
+                });
+                self.error = Some(why);
+            }
+            Pending::Stream => {}
+            Pending::Action { .. } => self.error = Some(why),
+        }
+    }
+
+    /// Twitch couldn't say what the token is: nothing is known against it, so
+    /// the check goes again.
+    fn check_again(&mut self, out: &mut Vec<Command>, why: String) {
+        self.error = Some(why);
+        let wait = self.backoff_ms.max(RETRY_MS);
+        self.backoff_ms = wait.saturating_mul(2).min(RETRY_MAX_MS);
+        out.push(Command::Timer {
+            id: "after-token".into(),
+            after_ms: wait,
+        });
+    }
+
+    /// The renewal didn't reach an answer: what it interrupted keeps waiting.
+    fn renew_again(&mut self, out: &mut Vec<Command>, why: String) {
+        self.refreshing = false;
+        self.error = Some(why);
+        out.push(Command::Timer {
+            id: "refresh".into(),
+            after_ms: RETRY_MAX_MS,
+        });
+    }
+
+    /// A create goes again after a wait that grows until the socket holds.
+    fn retry_sub(&mut self, out: &mut Vec<Command>) -> Sub {
+        let wait = self.sub_backoff_ms.max(RETRY_MS);
+        self.sub_backoff_ms = wait.saturating_mul(2).min(RETRY_MAX_MS);
+        out.push(Command::Timer {
+            id: "sub-retry".into(),
+            after_ms: wait,
+        });
+        Sub::Retrying
+    }
+
+    /// Whether the person has approved the waiting code yet.
+    fn device_answered(&mut self, out: &mut Vec<Command>, status: u16, parsed: &Json) {
+        match status {
+            200 => match protocol::parse_token(parsed) {
+                Ok(token) => {
+                    self.cancel_device(out);
+                    self.store_token(out, &token);
+                    // Another account's token may be replacing this one's: the
+                    // socket's subscriptions go with it. The token is in the
+                    // keyring now; a beat later the check names the account.
+                    self.drop_link(out);
+                    self.pending
+                        .retain(|_, p| !matches!(p, Pending::Validate | Pending::Refresh));
+                    self.refreshing = false;
+                    self.login = Login::Checking;
+                    self.identity = None;
+                    self.error = None;
+                    out.push(Command::Timer {
+                        id: "after-token".into(),
+                        after_ms: 500,
+                    });
+                }
+                Err(e) => self.error = Some(e),
+            },
+            400 => {
+                let why = parsed
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if why.contains("authorization_pending") {
+                    let wait = self.device.as_ref().map_or(5_000, |d| d.interval_ms);
+                    out.push(Command::Timer {
+                        id: "device-poll".into(),
+                        after_ms: wait,
+                    });
+                } else if why.contains("slow_down") {
+                    let wait = self.device.as_mut().map_or(10_000, |d| {
+                        d.interval_ms = d.interval_ms.saturating_add(5_000);
+                        d.interval_ms
+                    });
+                    out.push(Command::Timer {
+                        id: "device-poll".into(),
+                        after_ms: wait,
+                    });
+                } else {
+                    let why = protocol::parse_error(parsed)
+                        .unwrap_or_else(|| "the sign-in expired".to_owned());
                     self.cancel_device(out);
                     self.error = Some(why);
                 }
-            },
-            Pending::Subscribe { group } => {
-                if status == 202 {
-                    self.error = None;
-                } else {
-                    let why = protocol::parse_error(&parsed).unwrap_or_default();
-                    self.error = Some(format!("{}: {why}", group.key()));
-                }
             }
-            Pending::Chat
-            | Pending::Clip
-            | Pending::Marker
-            | Pending::Announce
-            | Pending::Title
-            | Pending::Commercial
-            | Pending::Poll => self.sent(out, status, &parsed, pending),
+            _ => {
+                let why = protocol::parse_error(parsed)
+                    .unwrap_or_else(|| format!("the sign-in was refused ({status})"));
+                self.cancel_device(out);
+                self.error = Some(why);
+            }
         }
-        out.extend(self.publish());
+    }
+
+    /// Reads the token a renewal carried: keeps it, and what it interrupted
+    /// goes again, once, since Twitch refused that before doing anything. A
+    /// renewal changes nothing the socket is holding.
+    fn accepted(&mut self, out: &mut Vec<Command>, token: Token) {
+        self.store_token(out, &token);
+        // A renewal answers with the token's own scopes: the held identity
+        // follows them, so a group that came into scope starts listening.
+        if let Some(identity) = self.identity.as_mut() {
+            identity.scopes = token.scopes.clone();
+        }
+        out.push(Command::Timer {
+            id: "refresh".into(),
+            after_ms: u32::try_from(token.expires_ms.saturating_sub(REFRESH_LEAD_MS))
+                .unwrap_or(u32::MAX),
+        });
+        for (action, request) in std::mem::take(&mut self.waiting) {
+            self.send_action(out, action, request, true);
+        }
+        if self.login == Login::Checking {
+            self.validate(out);
+        }
+    }
+
+    fn store_token(&self, out: &mut Vec<Command>, token: &Token) {
+        out.push(Command::StoreSecret {
+            slot: SECRET_AUTH.into(),
+            value: format!("Bearer {}", token.access),
+        });
+        if let Some(refresh) = &token.refresh {
+            out.push(Command::StoreSecret {
+                slot: SECRET_REFRESH.into(),
+                value: refresh.clone(),
+            });
+        }
     }
 
     /// What an action's answer means: done, a renewal, or the scope it lacks.
-    fn sent(&mut self, out: &mut Vec<Command>, status: u16, parsed: &Json, pending: Pending) {
-        let (what, scope) = match pending {
-            Pending::Chat => ("chat", SCOPE_CHAT),
-            Pending::Clip => ("clip", SCOPE_CLIP),
-            Pending::Marker => ("marker", SCOPE_BROADCAST),
-            Pending::Announce => ("announcement", SCOPE_ANNOUNCE),
-            Pending::Title => ("title", SCOPE_BROADCAST),
-            Pending::Commercial => ("commercial", SCOPE_COMMERCIAL),
-            Pending::Poll => ("poll", SCOPE_POLLS),
-            _ => return,
-        };
+    fn sent(
+        &mut self,
+        out: &mut Vec<Command>,
+        status: u16,
+        parsed: &Json,
+        action: Action,
+        request: Request,
+        retried: bool,
+    ) {
+        let (what, scope) = action.names();
         match status {
-            200 | 202 | 204 => {
-                self.error = None;
-                self.retry = None;
-                self.retrying = false;
+            200 | 202 | 204 => self.error = None,
+            401 if retried => {
+                self.error = Some(format!("{what} was refused after the token was renewed"));
             }
             401 => {
-                if self.retrying {
-                    self.retrying = false;
-                    self.retry = None;
-                    self.error = Some(format!("{what} was refused after the token was renewed"));
-                } else {
-                    self.retry = self.action.clone();
-                    out.push(Command::LoadSecret {
-                        slot: SECRET_REFRESH.into(),
-                    });
-                }
+                self.waiting.push((action, request));
+                self.refresh(out);
             }
             403 => self.error = Some(format!("{what} needs the token's {scope} scope")),
             _ => {
@@ -910,52 +1263,56 @@ impl Twitch {
         }
     }
 
-    /// A token that can't be renewed: the page asks for a new one.
-    fn expired(&mut self, out: &mut Vec<Command>) {
-        self.expired_with(out, "Twitch refused the token: connect again.".into());
-    }
-
-    /// The same, with what Twitch said about it.
-    fn expired_with(&mut self, out: &mut Vec<Command>, why: String) {
-        if let Some(ws) = self.ws.take() {
-            out.push(Command::Close { id: ws });
-        }
-        self.subscribed.clear();
-        self.missing.clear();
-        self.retry = None;
-        self.retrying = false;
-        self.identity = None;
-        self.phase = Some(Phase::Off);
+    /// A token that can't be renewed: the page asks for a new one. The
+    /// keyring keeps what it holds, since only Forget removes it.
+    fn expired(&mut self, out: &mut Vec<Command>, why: String) {
+        self.drop_link(out);
+        cancel(out, &["refresh"]);
+        self.waiting.clear();
+        self.refreshing = false;
+        self.login = Login::Expired;
         self.error = Some(why);
-        out.extend(self.publish());
     }
 
     fn refresh(&mut self, out: &mut Vec<Command>) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
         out.push(Command::LoadSecret {
             slot: SECRET_REFRESH.into(),
         });
     }
 
-    fn ui(&mut self, event: UiEvent) -> Vec<Command> {
-        let mut out = Vec::new();
-        match event {
-            UiEvent::Pressed { id } if id == "connect" => self.start_device(&mut out),
-            UiEvent::Pressed { id } if id == "cancel" => self.cancel_device(&mut out),
-            UiEvent::Pressed { id } if id == "forget" => out.extend(self.logout()),
-            UiEvent::Pressed { id } if id == "reconnect" => {
-                if let Some(ws) = self.ws.take() {
-                    out.push(Command::Close { id: ws });
-                }
-                self.connect(&mut out);
+    fn ui(&mut self, event: UiEvent, out: &mut Vec<Command>) {
+        let UiEvent::Pressed { id } = event else {
+            return;
+        };
+        match id.as_str() {
+            "connect" => self.start_device(out),
+            "cancel" => self.cancel_device(out),
+            "forget" => self.logout(out),
+            // Everything is asked again: what was refused, the token, the
+            // socket.
+            "reconnect" => {
+                self.drop_link(out);
+                self.pending
+                    .retain(|_, p| matches!(p, Pending::Action { .. }));
+                cancel(out, &["after-token"]);
+                self.refreshing = false;
+                self.login = Login::Checking;
+                self.error = None;
+                out.push(Command::LoadSecret {
+                    slot: SECRET_AUTH.into(),
+                });
             }
             _ => {}
         }
-        out.extend(self.publish());
-        out
     }
 
-    fn logout(&mut self) -> Vec<Command> {
-        let mut out = vec![
+    /// Forgets the account: every token, every timer, every answer still out.
+    fn logout(&mut self, out: &mut Vec<Command>) {
+        out.extend([
             Command::UnstoreSecret {
                 slot: SECRET_AUTH.into(),
             },
@@ -965,19 +1322,18 @@ impl Twitch {
             Command::Unstore {
                 key: K_IDENTITY.into(),
             },
-            Command::CancelTimer {
-                id: "refresh".into(),
-            },
-        ];
-        if let Some(ws) = self.ws.take() {
-            out.push(Command::Close { id: ws });
-        }
+        ]);
+        self.cancel_device(out);
+        self.drop_link(out);
+        cancel(out, &["refresh", "after-token"]);
+        self.pending.clear();
+        self.waiting.clear();
+        self.refreshing = false;
         self.identity = None;
-        self.device = None;
-        self.subscribed.clear();
-        self.phase = Some(Phase::Off);
+        self.login = Login::Out;
+        self.stream_live = false;
+        self.last = None;
         self.error = None;
-        out
     }
 
     fn call(&mut self, id: u64, method: &str, args: &[Value]) -> Vec<Command> {
@@ -988,7 +1344,7 @@ impl Twitch {
         };
         match method {
             "clip" => {
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
@@ -997,13 +1353,12 @@ impl Twitch {
                     self.refuse(&mut out, id, "A clip title is at most 140 bytes.");
                     return out;
                 }
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Clip,
                     "POST",
                     &protocol::clip_url(&identity.id, &title),
-                    true,
                     None,
-                    Pending::Clip,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1011,7 +1366,7 @@ impl Twitch {
                 });
             }
             "marker" => {
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
@@ -1020,16 +1375,15 @@ impl Twitch {
                     self.refuse(&mut out, id, "A marker's description is at most 140 bytes.");
                     return out;
                 }
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Marker,
                     "POST",
                     protocol::MARKER_URL,
-                    true,
                     Some((
                         "application/json",
                         protocol::marker_body(&identity.id, &description),
                     )),
-                    Pending::Marker,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1041,7 +1395,7 @@ impl Twitch {
                     self.refuse(&mut out, id, "A chat message needs text.");
                     return out;
                 };
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
@@ -1049,16 +1403,15 @@ impl Twitch {
                     self.refuse(&mut out, id, "A chat message is 1 to 500 bytes.");
                     return out;
                 }
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Chat,
                     "POST",
                     protocol::CHAT_URL,
-                    true,
                     Some((
                         "application/json",
                         protocol::chat_body(&identity.id, &identity.id, &message),
                     )),
-                    Pending::Chat,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1072,20 +1425,19 @@ impl Twitch {
                     self.refuse(&mut out, id, "An announcement is 1 to 500 bytes.");
                     return out;
                 };
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Announce,
                     "POST",
                     protocol::ANNOUNCE_URL,
-                    true,
                     Some((
                         "application/json",
                         protocol::announce_body(&identity.id, &identity.id, &message),
                     )),
-                    Pending::Announce,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1099,20 +1451,19 @@ impl Twitch {
                     self.refuse(&mut out, id, "A title is 1 to 140 bytes.");
                     return out;
                 };
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Title,
                     "PATCH",
                     &protocol::channel_url(&identity.id),
-                    true,
                     Some((
                         "application/json",
                         protocol::channel_body(Some(&title), None),
                     )),
-                    Pending::Title,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1133,20 +1484,19 @@ impl Twitch {
                     );
                     return out;
                 }
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Commercial,
                     "POST",
                     protocol::COMMERCIAL_URL,
-                    true,
                     Some((
                         "application/json",
                         protocol::commercial_body(&identity.id, seconds as u64),
                     )),
-                    Pending::Commercial,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1175,20 +1525,19 @@ impl Twitch {
                     }
                     _ => POLL_SECONDS,
                 };
-                let Some(identity) = self.identity.clone() else {
+                let Some(identity) = self.account() else {
                     self.refuse(&mut out, id, "Not logged in to Twitch.");
                     return out;
                 };
-                self.request(
+                self.act(
                     &mut out,
+                    Action::Poll,
                     "POST",
                     protocol::POLLS_URL,
-                    true,
                     Some((
                         "application/json",
                         protocol::poll_body(&identity.id, &title, &choices, seconds),
                     )),
-                    Pending::Poll,
                 );
                 out.push(Command::Reply {
                     id,
@@ -1200,34 +1549,54 @@ impl Twitch {
         out
     }
 
-    /// One EventSub frame, as the work it implies.
-    fn frame(&mut self, frame: Frame) -> Vec<Command> {
-        let mut out = Vec::new();
+    /// One EventSub frame from socket `socket`. Only the socket expected to
+    /// say so can welcome or end a session; a replacement's notifications
+    /// count from its first frame, and one seen on both counts once.
+    fn frame(&mut self, socket: u64, frame: Frame, out: &mut Vec<Command>) {
+        let current = self.ws.as_ref().is_some_and(|w| w.id == socket);
+        let replacing = self.next_ws == Some(socket);
         match frame {
             Frame::Welcome {
                 session,
                 keepalive_ms,
             } => {
-                self.phase = Some(Phase::Live { session });
-                self.keepalive_ms = keepalive_ms;
-                if let Some(old) = self.old_ws.take() {
-                    out.push(Command::Close { id: old });
+                if replacing {
+                    // A requested reconnect: Twitch carried the subscriptions
+                    // over, and the old socket has served its purpose.
+                    if let Some(old) = self.ws.take() {
+                        out.push(Command::Close { id: old.id });
+                    }
+                    self.next_ws = None;
+                } else if !current {
+                    return;
                 }
-                self.subscribed.clear();
-                self.subscribe(&mut out);
-                out.push(Command::Timer {
-                    id: "watchdog".into(),
-                    after_ms: (keepalive_ms * 2) as u32,
+                self.ws = Some(Socket {
+                    id: socket,
+                    session: Some(session),
                 });
+                self.keepalive_ms = keepalive_ms;
+                self.arm_watchdog(out);
             }
-            Frame::Keepalive => {
-                out.push(Command::Timer {
-                    id: "watchdog".into(),
-                    after_ms: (self.keepalive_ms.max(10_000) * 2) as u32,
-                });
-            }
-            Frame::Notification { kind, event } => {
+            Frame::Keepalive if current => self.arm_watchdog(out),
+            Frame::Notification { id, kind, event } if current || replacing => {
+                if current {
+                    self.arm_watchdog(out);
+                }
+                if !id.is_empty() {
+                    if self.seen.contains(&id) {
+                        return;
+                    }
+                    if self.seen.len() >= SEEN_MAX {
+                        self.seen.pop_front();
+                    }
+                    self.seen.push_back(id);
+                }
                 if let Some(fact) = protocol::decode(&kind, &event) {
+                    match fact.kind.as_str() {
+                        "stream.online" => self.stream_live = true,
+                        "stream.offline" => self.stream_live = false,
+                        _ => {}
+                    }
                     if let Some((name, value)) = signal_of(&fact) {
                         out.push(Command::Signal {
                             name: name.into(),
@@ -1237,22 +1606,56 @@ impl Twitch {
                     self.last = Some(fact);
                 }
             }
-            Frame::Reconnect { url } => {
+            Frame::Reconnect { url } if current && self.next_ws.is_none() => {
                 self.next_id += 1;
                 let id = self.next_id;
-                self.old_ws = self.ws.replace(id);
+                self.next_ws = Some(id);
                 out.push(Command::Open {
                     id,
                     to: Endpoint::Ws { url },
                 });
             }
-            Frame::Revocation { kind, status } => {
-                self.error = Some(format!("{kind}: {status}"));
+            Frame::Revocation { kind, status } if current => {
+                self.subs.insert(kind, Sub::Refused(status));
             }
-            // A frame this build doesn't know needs nothing.
-            Frame::Other(_) => {}
+            _ => {}
         }
-        out.extend(self.publish());
+    }
+
+    /// Twitch sends a keepalive when nothing else is due, so two of them
+    /// missing means the socket only looks open.
+    fn arm_watchdog(&self, out: &mut Vec<Command>) {
+        out.push(Command::Timer {
+            id: "watchdog".into(),
+            after_ms: u32::try_from(self.keepalive_ms.max(10_000) * 2).unwrap_or(u32::MAX),
+        });
+    }
+}
+
+/// Cancels the timers named.
+fn cancel(out: &mut Vec<Command>, timers: &[&str]) {
+    for id in timers {
+        out.push(Command::CancelTimer {
+            id: (*id).to_owned(),
+        });
+    }
+}
+
+impl Extension for Twitch {
+    fn manifest(&self) -> Manifest {
+        crate::manifest::build()
+    }
+
+    fn handle(&mut self, event: Event) -> Vec<Command> {
+        let mut out = Vec::new();
+        self.step(event, &mut out);
+        self.reconcile(&mut out);
+        let events = self.events();
+        if events == Events::Connected {
+            self.backoff_ms = 0;
+            self.sub_backoff_ms = 0;
+        }
+        self.publish(events, &mut out);
         out
     }
 }
@@ -1260,7 +1663,7 @@ impl Twitch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vrc_we_sdk::Does;
+    use vrc_we_sdk::{Does, Tone};
 
     fn answer(status: u16, body: &str) -> Result<vrc_we_sdk::HttpResponse, String> {
         Ok(vrc_we_sdk::HttpResponse {
@@ -1270,12 +1673,136 @@ mod tests {
         })
     }
 
-    fn welcome(session: &str) -> Event {
+    fn frame(socket: u64, kind: &str, payload: &str) -> Event {
         Event::Received {
-            id: 9,
+            id: socket,
             data: Data::Text(format!(
-                r#"{{"metadata":{{"message_type":"session_welcome"}},"payload":{{"session":{{"id":"{session}","keepalive_timeout_seconds":30}}}}}}"#
+                r#"{{"metadata":{{"message_type":"{kind}"}},"payload":{payload}}}"#
             )),
+        }
+    }
+
+    fn welcome(socket: u64, session: &str) -> Event {
+        frame(
+            socket,
+            "session_welcome",
+            &format!(r#"{{"session":{{"id":"{session}","keepalive_timeout_seconds":30}}}}"#),
+        )
+    }
+
+    /// The requests to `url` in `out`, by id.
+    fn requests_to(out: &[Command], url: &str) -> Vec<u64> {
+        out.iter()
+            .filter_map(|c| match c {
+                Command::Http { id, url: to, .. } if to.starts_with(url) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn request_to(out: &[Command], url: &str) -> u64 {
+        *requests_to(out, url)
+            .first()
+            .unwrap_or_else(|| panic!("a request to {url}: {out:?}"))
+    }
+
+    /// The socket `out` opens.
+    fn opened(out: &[Command]) -> Option<u64> {
+        out.iter().find_map(|c| match c {
+            Command::Open { id, .. } => Some(*id),
+            _ => None,
+        })
+    }
+
+    fn field(out: &[Command], name: &str) -> Option<Value> {
+        out.iter().rev().find_map(|c| match c {
+            Command::Field { name: n, value } if n == name => Some(value.clone()),
+            _ => None,
+        })
+    }
+
+    /// The status bar line `out` publishes.
+    fn line(out: &[Command]) -> Option<(Tone, String)> {
+        out.iter().rev().find_map(|c| match c {
+            Command::Status(Some(s)) => Some((s.tone, s.label.clone())),
+            _ => None,
+        })
+    }
+
+    fn page(out: &[Command]) -> Option<String> {
+        out.iter().rev().find_map(|c| match c {
+            Command::Page { view, .. } => Some(format!("{view:?}")),
+            _ => None,
+        })
+    }
+
+    fn every_scope() -> Vec<&'static str> {
+        GROUPS.iter().filter_map(|g| g.scope()).collect()
+    }
+
+    fn validated(scopes: &[&str]) -> Result<vrc_we_sdk::HttpResponse, String> {
+        let scopes = serde_json::to_string(scopes).unwrap();
+        answer(
+            200,
+            &format!(
+                r#"{{"client_id":"cid","login":"streamer","scopes":{scopes},"user_id":"1337","expires_in":3600}}"#
+            ),
+        )
+    }
+
+    /// A module started and signed in the way a launch does.
+    fn signed_in(scopes: &[&str]) -> Twitch {
+        let mut t = Twitch::default();
+        t.handle(Event::Start);
+        t.handle(Event::Loaded {
+            key: K_IDENTITY.into(),
+            value: None,
+        });
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_AUTH.into(),
+            value: Some("Bearer x".into()),
+        });
+        t.handle(Event::Http {
+            id: request_to(&out, protocol::VALIDATE_URL),
+            response: validated(scopes),
+        });
+        t
+    }
+
+    fn watch(t: &mut Twitch, fields: &[&str], signals: &[&str]) -> Vec<Command> {
+        let names = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect();
+        t.handle(Event::Watched {
+            fields: names(fields),
+            signals: names(signals),
+        })
+    }
+
+    /// Signed in with every scope, reading `signals`, its socket welcomed: the
+    /// module, the socket, and what the welcome sent.
+    fn welcomed(signals: &[&str]) -> (Twitch, u64, Vec<Command>) {
+        let mut t = signed_in(&every_scope());
+        let out = watch(&mut t, &[], signals);
+        let socket = opened(&out).expect("demand opens a socket");
+        let out = t.handle(welcome(socket, "s1"));
+        (t, socket, out)
+    }
+
+    /// Answers every create in `out` and those it leads to with `status`.
+    fn answer_creates(t: &mut Twitch, out: Vec<Command>, status: u16) -> Vec<Command> {
+        let mut out = out;
+        let mut all = Vec::new();
+        loop {
+            let ids = requests_to(&out, protocol::SUBSCRIPTIONS_URL);
+            all.append(&mut out);
+            if ids.is_empty() {
+                return all;
+            }
+            for id in ids {
+                out.extend(t.handle(Event::Http {
+                    id,
+                    response: answer(status, r#"{"message":"said no"}"#),
+                }));
+            }
         }
     }
 
@@ -1285,10 +1812,9 @@ mod tests {
     }
 
     #[test]
-    fn a_mapping_can_only_send_the_three_things_it_is_for() {
-        // Reacting is fields, the `fired` signal and the conditions; sending is
-        // these two. Signing out and reconnecting are maintenance, so the page
-        // holds them and nothing a trigger fires can reach them.
+    fn a_mapping_can_only_send_the_things_it_is_for() {
+        // Signing out and reconnecting are maintenance: the page holds them,
+        // and nothing a trigger fires can reach them.
         let manifest = Twitch::default().manifest();
         let actions: Vec<String> = manifest
             .actions
@@ -1298,18 +1824,16 @@ mod tests {
                 Does::Set => "set".into(),
             })
             .collect();
-        assert_eq!(
-            actions,
-            [
-                "chat",
-                "clip",
-                "marker",
-                "announce",
-                "title",
-                "commercial",
-                "poll"
-            ]
-        );
+        let sends = [
+            "chat",
+            "clip",
+            "marker",
+            "announce",
+            "title",
+            "commercial",
+            "poll",
+        ];
+        assert_eq!(actions, sends);
         let methods: Vec<&str> = manifest
             .namespace
             .as_ref()
@@ -1318,230 +1842,733 @@ mod tests {
             .iter()
             .map(|m| m.name.as_str())
             .collect();
+        assert_eq!(methods, sends, "each action calls its method");
+    }
+
+    /// Twitch closes a socket with no subscription after ten seconds, so with
+    /// nothing to subscribe none opens, and the page and the bar say signed in
+    /// rather than connected.
+    #[test]
+    fn with_nothing_to_subscribe_no_socket_opens() {
+        let mut t = Twitch::default();
+        let out = t.handle(Event::Start);
+        assert_eq!(opened(&out), None);
+        let mut t = signed_in(&[]);
+        let out = watch(&mut t, &["user", "error"], &[]);
+        assert_eq!(opened(&out), None, "reading its own state wants no event");
         assert_eq!(
-            methods,
-            [
-                "chat",
-                "clip",
-                "marker",
-                "announce",
-                "title",
-                "commercial",
-                "poll"
-            ],
-            "each action calls its method"
+            t.handle(Event::Timer {
+                id: "retry".into(),
+                at_ms: 0
+            })
+            .iter()
+            .filter(|c| matches!(c, Command::Open { .. }))
+            .count(),
+            0
+        );
+        assert_eq!(t.events(), Events::Idle);
+        let mut t = signed_in(&[]);
+        let out = watch(&mut t, &[], &["redeemed"]);
+        assert_eq!(
+            opened(&out),
+            None,
+            "its scope is missing, so nothing can be"
+        );
+        assert_eq!(
+            t.events(),
+            Events::Waiting,
+            "and that is waiting on the person"
+        );
+        assert_eq!(
+            line(&out),
+            Some((Tone::Waiting, "Waiting".to_owned())),
+            "{out:?}"
+        );
+        assert!(
+            page(&out).is_some_and(|p| p.contains("channel:read:redemptions")),
+            "the page says which scope: {out:?}"
         );
     }
 
+    /// The full surface goes through the host's bound a window at a time and
+    /// reaches connected only when every create is confirmed.
     #[test]
-    fn a_welcome_subscribes_what_is_enabled_and_arms_the_watchdog() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "client".into(),
-                scopes: vec![
-                    "channel:read:redemptions".into(),
-                    "channel:read:hype_train".into(),
-                ],
-                expires_ms: 3_600_000,
-            }),
-            watched: Watched {
-                fields: Vec::new(),
-                signals: vec!["redeemed".into(), "hype".into()],
-            },
-            ..Default::default()
-        };
-        let out = t.handle(welcome("s1"));
-        let posts: Vec<&str> = out
-            .iter()
-            .filter_map(|c| match c {
-                Command::Http { method, url, .. } if method == "POST" => Some(url.as_str()),
-                _ => None,
-            })
-            .collect();
+    fn demand_connects_and_subscribes_within_its_window_until_connected() {
+        let mut t = signed_in(&every_scope());
+        let out = watch(&mut t, &["event"], &[]);
+        let socket = opened(&out).expect("a socket");
+        assert_eq!(t.events(), Events::Connecting);
+        assert_eq!(line(&out), Some((Tone::Waiting, "Connecting".to_owned())));
+
+        let mut out = t.handle(welcome(socket, "s1"));
         assert_eq!(
-            posts.len(),
-            1 + 3,
-            "a redemption, and the hype train's three"
+            requests_to(&out, protocol::SUBSCRIPTIONS_URL).len(),
+            SUB_WINDOW,
+            "the first go out with the welcome, within Twitch's ten seconds"
         );
-        assert!(posts.iter().all(|u| *u == protocol::SUBSCRIPTIONS_URL));
-        assert!(
-            out.iter().any(|c| matches!(c, Command::Timer { id, after_ms } if id == "watchdog" && *after_ms == 60_000)),
-            "two keepalives of 30 s"
-        );
-        assert!(out
-            .iter()
-            .any(|c| matches!(c, Command::Field { name, .. } if name == "connected")));
+        assert_eq!(t.events(), Events::Waiting);
         assert_eq!(
-            t.phase(),
-            &Phase::Live {
-                session: "s1".into()
+            field(&out, "connected"),
+            None,
+            "it reads false until it holds"
+        );
+        let mut created = 0;
+        loop {
+            let ids = requests_to(&out, protocol::SUBSCRIPTIONS_URL);
+            if ids.is_empty() {
+                break;
             }
-        );
+            assert!(ids.len() <= SUB_WINDOW, "{}", ids.len());
+            assert_ne!(t.events(), Events::Connected, "not with creates still out");
+            created += ids.len();
+            let mut next = Vec::new();
+            for id in ids {
+                next.extend(t.handle(Event::Http {
+                    id,
+                    response: answer(202, "{}"),
+                }));
+            }
+            out = next;
+        }
+        assert_eq!(created, 16);
+        assert_eq!(t.events(), Events::Connected);
+        assert_eq!(field(&out, "connected"), Some(Value::Bool(true)));
+        assert_eq!(line(&out), Some((Tone::Good, "Connected".to_owned())));
+        assert!(page(&out).is_some_and(|p| p.contains("Listening for")));
     }
 
     #[test]
-    fn a_redemption_reaches_the_fields_a_mapping_conditions_on() {
-        let mut t = Twitch::default();
-        let out = t.handle(Event::Received {
-            id: 9,
-            data: Data::Text(
-                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.channel_points_custom_reward_redemption.add"},"payload":{"event":{"user_name":"Cooler_User","user_input":"pogchamp","reward":{"title":"Dance","cost":100}}}}"#
-                    .into(),
-            ),
-        });
-        let field = |name: &str| {
-            out.iter().find_map(|c| match c {
-                Command::Field { name: n, value } if n == name => Some(value.clone()),
-                _ => None,
-            })
-        };
-        assert_eq!(field("reward"), Some(Value::Text("Dance".into())));
-        assert_eq!(field("input"), Some(Value::Text("pogchamp".into())));
-        assert_eq!(field("user_name"), Some(Value::Text("Cooler_User".into())));
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Signal { name, value }
-                if name == "redeemed" && *value == Value::Text("Dance".into()))),
-            "and its signal carries the reward, which is what a mapping matches on"
-        );
+    fn reading_connected_holds_a_socket_open_with_the_group_that_needs_no_scope() {
+        let mut t = signed_in(&[]);
+        let out = watch(&mut t, &["connected"], &[]);
+        let socket = opened(&out).expect("a socket");
+        let out = t.handle(welcome(socket, "s1"));
+        let out = answer_creates(&mut t, out, 202);
+        assert_eq!(field(&out, "connected"), Some(Value::Bool(true)));
     }
 
+    /// A refusal is sticky: the socket Twitch then closes doesn't come back to
+    /// ask again, and the person sees why until they press Reconnect.
     #[test]
-    fn a_number_group_signal_carries_its_number() {
-        let mut t = Twitch::default();
-        let out = t.handle(Event::Received {
-            id: 9,
-            data: Data::Text(
-                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.hype_train.progress"},"payload":{"event":{"level":3,"total":900,"progress":500,"goal":1000}}}"#
-                    .into(),
-            ),
-        });
+    fn a_refused_group_waits_with_its_reason_and_never_loops() {
+        let (mut t, socket, out) = welcomed(&["redeemed"]);
+        let out = answer_creates(&mut t, out, 403);
+        assert_eq!(t.events(), Events::Waiting);
+        assert_eq!(line(&out), Some((Tone::Waiting, "Waiting".to_owned())));
         assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Signal { name, value }
-                if name == "hype" && *value == Value::Number(3.0))),
-            "a mapping compares hype_level, hype_progress or hype_goal as numbers: {out:?}"
+            page(&out).is_some_and(|p| p.contains("said no")),
+            "Twitch's reason is on the page: {out:?}"
         );
-        assert_eq!(
-            t.manifest()
-                .namespace
-                .expect("a namespace")
-                .signals
-                .iter()
-                .find(|s| s.name == "hype")
-                .map(|s| s.payload.clone()),
-            Some(Shape::Number(None)),
-            "and the manifest says so"
-        );
-    }
 
-    #[test]
-    fn a_poll_end_carries_its_winner_and_votes() {
-        let mut t = Twitch::default();
-        let out = t.handle(Event::Received {
-            id: 9,
-            data: Data::Text(
-                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.poll.end"},"payload":{"event":{"title":"Shoes?","status":"completed","choices":[{"title":"Yeah","votes":120},{"title":"No","votes":140}]}}}"#
-                    .into(),
-            ),
+        let out = t.handle(Event::Closed {
+            id: socket,
+            error: None,
         });
-        let field = |name: &str| {
-            out.iter().find_map(|c| match c {
-                Command::Field { name: n, value } if n == name => Some(value.clone()),
-                _ => None,
-            })
-        };
-        assert_eq!(field("poll_title"), Some(Value::Text("Shoes?".into())));
-        assert_eq!(field("poll_status"), Some(Value::Text("completed".into())));
-        assert_eq!(field("poll_winner"), Some(Value::Text("No".into())));
-        assert_eq!(field("poll_votes"), Some(Value::Number(260.0)));
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Signal { name, value }
-                if name == "poll_ended" && *value == Value::Text("No".into()))),
-            "the winner is what a mapping matches: {out:?}"
-        );
-    }
+        assert_eq!(opened(&out), None);
+        let out = t.handle(Event::Timer {
+            id: "retry".into(),
+            at_ms: 0,
+        });
+        assert_eq!(opened(&out), None, "nothing it could ask has changed");
 
-    #[test]
-    fn a_gift_and_the_streams_own_state_have_their_own_signals() {
-        let mut t = Twitch::default();
-        let out = t.handle(Event::Received {
-            id: 9,
-            data: Data::Text(
-                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.subscription.gift"},"payload":{"event":{"user_name":"Giver","tier":2000,"total":5}}}"#
-                    .into(),
-            ),
+        let out = t.handle(Event::Ui {
+            page: PAGE.into(),
+            event: UiEvent::Pressed {
+                id: "reconnect".into(),
+            },
         });
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Signal { name, value }
-                if name == "gifted" && *value == Value::Number(5.0))),
-            "five gifts, not five months: {out:?}"
-        );
-        let out = t.handle(Event::Received {
-            id: 9,
-            data: Data::Text(
-                r#"{"metadata":{"message_type":"notification","subscription_type":"stream.online"},"payload":{"event":{"type":"live","started_at":"2020-07-15T17:16:03Z"}}}"#
-                    .into(),
-            ),
-        });
-        let live = out.iter().find_map(|c| match c {
-            Command::Field { name, value } if name == "live" => Some(value.clone()),
-            _ => None,
-        });
-        assert_eq!(live, Some(Value::Bool(true)));
         assert!(out
             .iter()
-            .any(|c| matches!(c, Command::Signal { name, .. } if name == "went_live")));
+            .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_AUTH)));
+        assert_eq!(t.subs.len(), 0, "Reconnect asks again");
+    }
+
+    /// Twitch carries the subscriptions over a requested reconnect, so nothing
+    /// is created again and the old socket's close changes nothing.
+    #[test]
+    fn a_requested_reconnect_stays_connected() {
+        let (mut t, old, out) = welcomed(&["cheered"]);
+        answer_creates(&mut t, out, 202);
+        assert_eq!(t.events(), Events::Connected);
+        let out = t.handle(frame(
+            old,
+            "session_reconnect",
+            r#"{"session":{"reconnect_url":"wss://edge.example/ws"}}"#,
+        ));
+        let new = opened(&out).expect("the replacement");
+        assert_eq!(t.events(), Events::Connected, "the old one still holds it");
+
+        let out = t.handle(welcome(new, "s2"));
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::Close { id } if *id == old)),
+            "the old socket goes at the new welcome: {out:?}"
+        );
+        assert!(requests_to(&out, protocol::SUBSCRIPTIONS_URL).is_empty());
+        assert_eq!(t.events(), Events::Connected);
+
+        let out = t.handle(Event::Closed {
+            id: old,
+            error: None,
+        });
+        assert_eq!(opened(&out), None);
+        assert_eq!(t.events(), Events::Connected);
+
+        let stale = t.handle(welcome(old, "s3"));
+        assert_eq!(
+            t.ws.as_ref().and_then(|w| w.session.as_deref()),
+            Some("s2"),
+            "a socket that isn't expected can't start a session: {stale:?}"
+        );
+    }
+
+    /// The old socket closing first doesn't lose what the replacement brings.
+    #[test]
+    fn the_old_socket_closing_before_the_new_welcome_keeps_the_subscriptions() {
+        let (mut t, old, out) = welcomed(&["cheered"]);
+        answer_creates(&mut t, out, 202);
+        let out = t.handle(frame(
+            old,
+            "session_reconnect",
+            r#"{"session":{"reconnect_url":"wss://edge.example/ws"}}"#,
+        ));
+        let new = opened(&out).expect("the replacement");
+        let out = t.handle(Event::Closed {
+            id: old,
+            error: None,
+        });
+        assert_eq!(opened(&out), None, "the replacement is already on its way");
+        let out = t.handle(welcome(new, "s2"));
+        assert!(requests_to(&out, protocol::SUBSCRIPTIONS_URL).is_empty());
+        assert_eq!(t.events(), Events::Connected);
+    }
+
+    /// A socket lost for any other reason takes its subscriptions with it, and
+    /// another opens after a wait that grows until one holds.
+    #[test]
+    fn a_lost_socket_comes_back_after_a_growing_wait_and_subscribes_again() {
+        let (mut t, socket, out) = welcomed(&["cheered"]);
+        answer_creates(&mut t, out, 202);
+        let wait = |out: &[Command]| {
+            out.iter().find_map(|c| match c {
+                Command::Timer { id, after_ms } if id == "retry" => Some(*after_ms),
+                _ => None,
+            })
+        };
+        let out = t.handle(Event::Closed {
+            id: socket,
+            error: None,
+        });
+        assert_eq!(wait(&out), Some(RETRY_MS));
+        assert_eq!(opened(&out), None);
+        assert_eq!(field(&out, "connected"), Some(Value::Bool(false)));
+        assert_eq!(line(&out), Some((Tone::Waiting, "Connecting".to_owned())));
+
+        let out = t.handle(Event::Timer {
+            id: "retry".into(),
+            at_ms: 0,
+        });
+        let again = opened(&out).expect("it opens again");
+        let out = t.handle(Event::Closed {
+            id: again,
+            error: Some("refused".into()),
+        });
+        assert_eq!(wait(&out), Some(RETRY_MS * 2));
+
+        let out = t.handle(Event::Timer {
+            id: "retry".into(),
+            at_ms: 0,
+        });
+        let third = opened(&out).expect("it opens again");
+        let out = t.handle(welcome(third, "s2"));
+        assert_eq!(
+            requests_to(&out, protocol::SUBSCRIPTIONS_URL).len(),
+            1,
+            "the session's subscriptions went with it"
+        );
+        answer_creates(&mut t, out, 202);
+        assert_eq!(t.backoff_ms, 0, "connected resets the wait");
+    }
+
+    /// A notification counts as life, and one delivered twice counts once.
+    #[test]
+    fn a_notification_resets_the_watchdog_and_a_repeat_counts_once() {
+        let (mut t, socket, _) = welcomed(&["cheered"]);
+        let cheer = Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","message_id":"m1","subscription_type":"channel.cheer"},"payload":{"event":{"user_name":"a","bits":5,"message":"hi"}}}"#
+                    .into(),
+            ),
+        };
+        let out = t.handle(cheer.clone());
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::Timer { id, after_ms } if id == "watchdog" && *after_ms == 60_000)));
+        assert!(out.iter().any(|c| matches!(c, Command::Signal { .. })));
+        let out = t.handle(cheer);
+        assert!(!out.iter().any(|c| matches!(c, Command::Signal { .. })));
     }
 
     #[test]
-    fn a_live_field_reading_subscribes_the_two_stream_events() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "client".into(),
-                scopes: Vec::new(),
-                expires_ms: 3_600_000,
-            }),
-            watched: Watched {
-                fields: vec!["live".into()],
-                signals: Vec::new(),
+    fn a_frame_from_a_socket_it_doesnt_know_changes_nothing() {
+        let (mut t, _, _) = welcomed(&["cheered"]);
+        let out = t.handle(Event::Received {
+            id: 999,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.cheer"},"payload":{"event":{"user_name":"a","bits":5}}}"#
+                    .into(),
+            ),
+        });
+        assert!(!out.iter().any(|c| matches!(c, Command::Signal { .. })));
+        assert_eq!(field(&out, "bits"), None);
+    }
+
+    #[test]
+    fn a_renewal_while_connected_opens_nothing_and_a_create_waits_for_one() {
+        let (mut t, _, out) = welcomed(&["cheered", "raided"]);
+        let creates = requests_to(&out, protocol::SUBSCRIPTIONS_URL);
+        // The token ran out under a create: it waits for the new one.
+        let out = t.handle(Event::Http {
+            id: creates[0],
+            response: answer(401, "{}"),
+        });
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH)));
+        assert!(
+            requests_to(&out, protocol::SUBSCRIPTIONS_URL).is_empty(),
+            "it would only meet the same refusal"
+        );
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_REFRESH.into(),
+            value: Some("r1".into()),
+        });
+        let renew = request_to(&out, protocol::TOKEN_URL);
+        let out = t.handle(Event::Http {
+            id: renew,
+            response: answer(
+                200,
+                &format!(
+                    r#"{{"access_token":"new","refresh_token":"r2","expires_in":3600,"scope":{}}}"#,
+                    serde_json::to_string(&every_scope()).unwrap()
+                ),
+            ),
+        });
+        assert_eq!(opened(&out), None, "the socket holds through a renewal");
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::StoreSecret { slot, value }
+            if slot == SECRET_AUTH && value == "Bearer new")));
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::StoreSecret { slot, value }
+            if slot == SECRET_REFRESH && value == "r2")));
+        assert_eq!(requests_to(&out, protocol::SUBSCRIPTIONS_URL).len(), 1);
+        let mut rest = out;
+        rest.extend(t.handle(Event::Http {
+            id: creates[1],
+            response: answer(202, "{}"),
+        }));
+        answer_creates(&mut t, rest, 202);
+        assert_eq!(t.events(), Events::Connected);
+    }
+
+    /// Forgetting ends everything: no answer still out and no timer brings the
+    /// account or a socket back.
+    #[test]
+    fn forgetting_drops_every_late_answer_and_nothing_reconnects() {
+        let (mut t, socket, out) = welcomed(&["cheered"]);
+        let create = request_to(&out, protocol::SUBSCRIPTIONS_URL);
+        let chat = t.handle(Event::Call {
+            id: 1,
+            method: "chat".into(),
+            args: vec![Value::Text("hi".into())],
+            from: None,
+        });
+        let chat = request_to(&chat, protocol::CHAT_URL);
+        let out = t.handle(Event::Ui {
+            page: PAGE.into(),
+            event: UiEvent::Pressed {
+                id: "forget".into(),
             },
-            ..Default::default()
+        });
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::UnstoreSecret { slot } if slot == SECRET_AUTH)));
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::Close { id } if *id == socket)));
+        assert_eq!(line(&out), Some((Tone::Idle, "Not signed in".to_owned())));
+        for event in [
+            Event::Http {
+                id: create,
+                response: answer(202, "{}"),
+            },
+            Event::Http {
+                id: chat,
+                response: answer(401, "{}"),
+            },
+            Event::Timer {
+                id: "watchdog".into(),
+                at_ms: 0,
+            },
+            Event::Timer {
+                id: "retry".into(),
+                at_ms: 0,
+            },
+            Event::Closed {
+                id: socket,
+                error: None,
+            },
+            Event::SecretLoaded {
+                slot: SECRET_AUTH.into(),
+                value: Some("Bearer late".into()),
+            },
+        ] {
+            let out = t.handle(event);
+            assert_eq!(opened(&out), None, "{out:?}");
+            assert!(requests_to(&out, "https://").is_empty(), "{out:?}");
+            assert!(out.iter().all(|c| !matches!(c, Command::LoadSecret { .. })));
+        }
+        assert_eq!(t.login, Login::Out);
+    }
+
+    /// An unreadable keyring reads the same as no token, so it must never lose
+    /// what a later launch or Reconnect could still use.
+    #[test]
+    fn a_token_that_cant_be_read_forgets_nothing() {
+        let mut t = Twitch::default();
+        t.handle(Event::Start);
+        let identity =
+            r#"{"id":"1337","login":"streamer","client_id":"cid","scopes":[],"expires_ms":1000}"#;
+        t.handle(Event::Loaded {
+            key: K_IDENTITY.into(),
+            value: Some(identity.into()),
+        });
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_AUTH.into(),
+            value: None,
+        });
+        assert_eq!(t.login, Login::Out);
+        assert!(out
+            .iter()
+            .all(|c| !matches!(c, Command::UnstoreSecret { .. } | Command::Unstore { .. })));
+        assert_eq!(
+            t.identity.as_ref().map(|i| i.login.as_str()),
+            Some("streamer")
+        );
+        assert_eq!(line(&out), Some((Tone::Idle, "Not signed in".to_owned())));
+        let page = page(&out).expect("a page");
+        assert!(
+            page.contains("reconnect"),
+            "the keyring may answer now: {page}"
+        );
+        assert!(page.contains("forget"));
+    }
+
+    /// Each refused action goes again itself, once, on one renewal.
+    #[test]
+    fn overlapping_refused_actions_each_repeat_their_own_request_once() {
+        let mut t = signed_in(&[SCOPE_CHAT]);
+        let call = |t: &mut Twitch, id, text: &str| {
+            let out = t.handle(Event::Call {
+                id,
+                method: "chat".into(),
+                args: vec![Value::Text(text.into())],
+                from: None,
+            });
+            request_to(&out, protocol::CHAT_URL)
         };
-        let out = t.handle(welcome("s1"));
-        let types: Vec<String> = out
+        let first = call(&mut t, 1, "first");
+        let second = call(&mut t, 2, "second");
+        let refused = |id| Event::Http {
+            id,
+            response: answer(401, "{}"),
+        };
+        let out = t.handle(refused(first));
+        assert_eq!(
+            out.iter()
+                .filter(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH))
+                .count(),
+            1
+        );
+        let out = t.handle(refused(second));
+        assert!(
+            !out.iter().any(|c| matches!(c, Command::LoadSecret { .. })),
+            "one renewal serves both"
+        );
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_REFRESH.into(),
+            value: Some("r1".into()),
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::TOKEN_URL),
+            response: answer(
+                200,
+                r#"{"access_token":"new","refresh_token":"r2","expires_in":3600,"scope":["user:write:chat"]}"#,
+            ),
+        });
+        let bodies: Vec<String> = out
             .iter()
             .filter_map(|c| match c {
                 Command::Http {
-                    method,
+                    url,
                     body: Some(Data::Text(b)),
                     ..
-                } if method == "POST" => Some(b.clone()),
+                } if url == protocol::CHAT_URL => Some(b.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(types.len(), 2, "online and offline: {types:?}");
-        assert!(types.iter().all(|b| b.contains("stream.")));
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("first") && bodies[1].contains("second"));
+        let again = requests_to(&out, protocol::CHAT_URL);
+        let out = t.handle(refused(again[0]));
+        assert!(
+            !out.iter().any(|c| matches!(c, Command::LoadSecret { .. })),
+            "a second refusal is reported, not renewed"
+        );
+        assert!(t
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("after the token was renewed")));
+    }
+
+    /// `live` is the stream's own state: read when something wants it, moved by
+    /// its two events, and untouched by any other.
+    #[test]
+    fn live_survives_other_events_and_starts_from_what_twitch_says() {
+        let (mut t, socket, out) = welcomed(&["went_live", "cheered"]);
+        let read = request_to(&out, protocol::STREAMS_URL);
+        let out = t.handle(Event::Http {
+            id: read,
+            response: answer(200, r#"{"data":[{"type":"live"}]}"#),
+        });
+        assert_eq!(field(&out, "live"), Some(Value::Bool(true)));
+        let cheer = Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.cheer"},"payload":{"event":{"user_name":"a","bits":5}}}"#
+                    .into(),
+            ),
+        };
+        let out = t.handle(cheer);
+        assert_eq!(field(&out, "bits"), Some(Value::Number(5.0)));
+        assert_eq!(field(&out, "live"), None, "unchanged, so unsent");
+        assert!(t.stream_live);
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"stream.offline"},"payload":{"event":{}}}"#
+                    .into(),
+            ),
+        });
+        assert_eq!(field(&out, "live"), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn a_chat_signal_stays_within_its_bytes_on_a_character() {
+        let (mut t, socket, _) = welcomed(&["chatted"]);
+        let message = "é".repeat(40);
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(format!(
+                r#"{{"metadata":{{"message_type":"notification","subscription_type":"channel.chat.message"}},"payload":{{"event":{{"chatter_user_name":"a","message":{{"text":"{message}"}}}}}}}}"#
+            )),
+        });
+        let carried = out.iter().find_map(|c| match c {
+            Command::Signal {
+                value: Value::Text(text),
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        });
+        let carried = carried.expect("a signal");
+        assert!(carried.len() <= 64, "{}", carried.len());
+        assert_eq!(carried, "é".repeat(32));
+    }
+
+    /// A press before Twitch answers doesn't ask twice, and an answer to a
+    /// cancelled sign-in stores nothing.
+    #[test]
+    fn a_device_sign_in_asks_once_and_a_cancelled_one_stays_cancelled() {
+        let mut t = Twitch::default();
+        let press = |id: &str| Event::Ui {
+            page: PAGE.into(),
+            event: UiEvent::Pressed { id: id.into() },
+        };
+        let out = t.handle(press("connect"));
+        assert_eq!(
+            line(&out),
+            Some((Tone::Waiting, "Waiting for your approval".to_owned()))
+        );
+        let asked = request_to(&out, protocol::DEVICE_URL);
+        let again = t.handle(press("connect"));
+        assert!(requests_to(&again, protocol::DEVICE_URL).is_empty());
+        let out = t.handle(Event::Http {
+            id: asked,
+            response: answer(
+                200,
+                r#"{"device_code":"dc","expires_in":1800,"interval":5,"user_code":"ABCDEFGH","verification_uri":"https://www.twitch.tv/activate?public=true&device-code=ABCDEFGH"}"#,
+            ),
+        });
+        assert!(page(&out).is_some_and(|p| p.contains("twitch.tv/activate")));
+        let out = t.handle(Event::Timer {
+            id: "device-poll".into(),
+            at_ms: 0,
+        });
+        let poll = request_to(&out, protocol::TOKEN_URL);
+        t.handle(press("cancel"));
+        let out = t.handle(Event::Http {
+            id: poll,
+            response: answer(
+                200,
+                r#"{"access_token":"abc","refresh_token":"ref","expires_in":14400,"scope":[],"token_type":"bearer"}"#,
+            ),
+        });
+        assert!(
+            !out.iter().any(|c| matches!(c, Command::StoreSecret { .. })),
+            "the late approval stores nothing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_approved_sign_in_keeps_both_tokens_and_then_names_the_account() {
+        let mut t = Twitch::default();
+        let out = t.handle(Event::Ui {
+            page: PAGE.into(),
+            event: UiEvent::Pressed {
+                id: "connect".into(),
+            },
+        });
+        t.handle(Event::Http {
+            id: request_to(&out, protocol::DEVICE_URL),
+            response: answer(
+                200,
+                r#"{"device_code":"dc","expires_in":1800,"interval":5,"user_code":"A","verification_uri":"https://www.twitch.tv/activate"}"#,
+            ),
+        });
+        let out = t.handle(Event::Timer {
+            id: "device-poll".into(),
+            at_ms: 0,
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::TOKEN_URL),
+            response: answer(
+                200,
+                r#"{"access_token":"abc","refresh_token":"ref","expires_in":14400,"scope":["user:read:chat"],"token_type":"bearer"}"#,
+            ),
+        });
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::StoreSecret { slot, value }
+            if slot == SECRET_AUTH && value == "Bearer abc")));
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::StoreSecret { slot, value }
+            if slot == SECRET_REFRESH && value == "ref")));
+        assert!(t.device.is_none(), "the waiting code is spent");
+        let out = t.handle(Event::Timer {
+            id: "after-token".into(),
+            at_ms: 0,
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::VALIDATE_URL),
+            response: validated(&[]),
+        });
+        assert_eq!(line(&out), Some((Tone::Idle, "Signed in".to_owned())));
+        assert!(page(&out).is_some_and(|p| p.contains("Signed in as streamer")));
+    }
+
+    #[test]
+    fn a_check_arms_the_renewal_from_the_tokens_own_life() {
+        let mut t = Twitch::default();
+        t.handle(Event::Start);
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_AUTH.into(),
+            value: Some("Bearer x".into()),
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::VALIDATE_URL),
+            response: validated(&[]),
+        });
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::Timer { id, after_ms }
+                if id == "refresh" && *after_ms == 3_540_000)),
+            "an hour less the minute it renews ahead: {out:?}"
+        );
+    }
+
+    /// Unreachable is not refused: the check goes again, and nothing reads as
+    /// signed out while it does.
+    #[test]
+    fn a_check_that_cant_reach_twitch_goes_again() {
+        let mut t = Twitch::default();
+        t.handle(Event::Start);
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_AUTH.into(),
+            value: Some("Bearer x".into()),
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::VALIDATE_URL),
+            response: Err("no route".into()),
+        });
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::Timer { id, .. } if id == "after-token")));
+        assert_eq!(t.login, Login::Checking);
+        assert_eq!(field(&out, "error"), Some(Value::Text("no route".into())));
+    }
+
+    #[test]
+    fn a_spent_refresh_token_says_what_twitch_said_and_keeps_the_account() {
+        let mut t = signed_in(&[]);
+        let out = t.handle(Event::Timer {
+            id: "refresh".into(),
+            at_ms: 0,
+        });
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH)));
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_REFRESH.into(),
+            value: Some("spent".into()),
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::TOKEN_URL),
+            response: answer(
+                400,
+                r#"{"error":"invalid_grant","message":"Invalid refresh token"}"#,
+            ),
+        });
+        assert_eq!(t.error.as_deref(), Some("Invalid refresh token"));
+        assert_eq!(t.login, Login::Expired);
+        assert_eq!(line(&out), Some((Tone::Bad, "Sign-in expired".to_owned())));
+        assert!(page(&out).is_some_and(|p| p.contains("connect")));
+    }
+
+    #[test]
+    fn a_dead_token_asks_for_a_renewal_rather_than_showing_a_failure() {
+        let mut t = Twitch::default();
+        t.handle(Event::Start);
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_AUTH.into(),
+            value: Some("Bearer x".into()),
+        });
+        let out = t.handle(Event::Http {
+            id: request_to(&out, protocol::VALIDATE_URL),
+            response: answer(401, r#"{"message":"Invalid OAuth token"}"#),
+        });
+        assert!(out
+            .iter()
+            .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH)));
+        assert!(t.error.is_none(), "{:?}", t.error);
     }
 
     #[test]
     fn clip_and_marker_are_the_helix_calls_twitch_documents() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "client".into(),
-                scopes: Vec::new(),
-                expires_ms: 3_600_000,
-            }),
-            ..Default::default()
-        };
+        let mut t = signed_in(&[]);
         let out = t.handle(Event::Call {
             id: 1,
             method: "clip".into(),
@@ -1556,10 +2583,7 @@ mod tests {
         });
         let (url, body) = clip.expect("a clip call");
         assert!(url.contains("broadcaster_id=1337"), "{url}");
-        assert!(
-            url.contains("title=nice"),
-            "the title is a query parameter: {url}"
-        );
+        assert!(url.contains("title=nice"), "a query parameter: {url}");
         assert!(body.is_none());
 
         let out = t.handle(Event::Call {
@@ -1580,22 +2604,11 @@ mod tests {
         let marker = marker.expect("a marker call");
         assert!(marker.contains("\"user_id\":\"1337\""), "{marker}");
         assert!(marker.contains("redeem"), "{marker}");
-        // The scopes are the person's own token's; a refusal names the one
-        // the action needed (`sent`), so nothing here asks for them.
     }
 
     #[test]
     fn a_chat_send_needs_a_login_and_a_message() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "client".into(),
-                scopes: Vec::new(),
-                expires_ms: 3_600_000,
-            }),
-            ..Default::default()
-        };
+        let mut t = signed_in(&[]);
         let out = t.handle(Event::Call {
             id: 4,
             method: "chat".into(),
@@ -1629,317 +2642,119 @@ mod tests {
     }
 
     #[test]
-    fn connecting_starts_a_device_sign_in_and_the_page_carries_its_link() {
-        let mut t = Twitch::default();
-        let out = t.handle(Event::Ui {
-            page: PAGE.into(),
-            event: UiEvent::Pressed {
-                id: "connect".into(),
-            },
-        });
-        let (id, body) = out
-            .iter()
-            .find_map(|c| match c {
-                Command::Http { id, url, body, .. } if url == protocol::DEVICE_URL => Some((
-                    *id,
-                    match body {
-                        Some(Data::Text(text)) => text.clone(),
-                        _ => String::new(),
-                    },
-                )),
-                _ => None,
-            })
-            .expect("a device request");
-        assert!(
-            body.contains("client_id=") && body.contains("scopes="),
-            "the application and every scope it may need: {body}"
-        );
-        assert!(
-            !out.iter().any(|c| matches!(c, Command::StoreSecret { .. })),
-            "nothing is stored before the person approves"
-        );
-
-        // Twitch answers with the code to poll and the address to approve,
-        // code already in it.
-        let out = t.handle(Event::Http {
-            id,
-            response: answer(
-                200,
-                r#"{"device_code":"dc","expires_in":1800,"interval":5,"user_code":"ABCDEFGH","verification_uri":"https://www.twitch.tv/activate?public=true&device-code=ABCDEFGH"}"#,
+    fn a_redemption_reaches_the_fields_a_mapping_conditions_on() {
+        let (mut t, socket, _) = welcomed(&["redeemed"]);
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.channel_points_custom_reward_redemption.add"},"payload":{"event":{"user_name":"Cooler_User","user_input":"pogchamp","reward":{"title":"Dance","cost":100}}}}"#
+                    .into(),
             ),
         });
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Timer { id, after_ms }
-                if id == "device-poll" && *after_ms == 5_000)),
-            "the poll waits the interval it was given: {out:?}"
-        );
-        assert!(
-            out.iter().any(|c| matches!(c, Command::Page { view, .. }
-                if format!("{view:?}").contains("twitch.tv/activate"))),
-            "the page offers the address, not a field"
-        );
-    }
-
-    #[test]
-    fn an_approved_sign_in_keeps_both_tokens_and_then_names_the_account() {
-        let mut t = Twitch {
-            device: Some(protocol::DeviceCode {
-                code: "dc".into(),
-                link: "https://www.twitch.tv/activate?public=true&device-code=ABCDEFGH".into(),
-                interval_ms: 5_000,
-                expires_ms: 1_800_000,
-            }),
-            ..Twitch::default()
+        let field = |name: &str| {
+            out.iter().find_map(|c| match c {
+                Command::Field { name: n, value } if n == name => Some(value.clone()),
+                _ => None,
+            })
         };
-        t.pending.insert(1, Pending::DeviceToken);
-        let out = t.handle(Event::Http {
-            id: 1,
-            response: answer(
-                200,
-                r#"{"access_token":"abc","refresh_token":"ref","expires_in":14400,"scope":["user:read:chat"],"token_type":"bearer"}"#,
-            ),
-        });
+        assert_eq!(field("reward"), Some(Value::Text("Dance".into())));
+        assert_eq!(field("input"), Some(Value::Text("pogchamp".into())));
+        assert_eq!(field("user_name"), Some(Value::Text("Cooler_User".into())));
         assert!(
             out.iter()
-                .any(|c| matches!(c, Command::StoreSecret { slot, value }
-                if slot == SECRET_AUTH && value == "Bearer abc")),
-            "the access token is kept as both Helix and the check take it"
-        );
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::StoreSecret { slot, value }
-                if slot == SECRET_REFRESH && value == "ref")),
-            "and its one-time refresh token, which Twitch rotates"
-        );
-        assert!(t.device.is_none(), "the waiting code is spent");
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Timer { id, .. } if id == "after-token")),
-            "the check follows once the keyring holds it: {out:?}"
+                .any(|c| matches!(c, Command::Signal { name, value }
+                if name == "redeemed" && *value == Value::Text("Dance".into()))),
+            "and its signal carries the reward, which is what a mapping matches on"
         );
     }
 
     #[test]
-    fn a_check_arms_the_renewal_from_the_tokens_own_life() {
-        let mut t = Twitch::default();
-        let out = t.handle(Event::SecretLoaded {
-            slot: SECRET_AUTH.into(),
-            value: Some("Bearer x".into()),
-        });
-        let id = out
-            .iter()
-            .find_map(|c| match c {
-                Command::Http { id, url, .. } if url == protocol::VALIDATE_URL => Some(*id),
-                _ => None,
-            })
-            .expect("a check");
-        let out = t.handle(Event::Http {
-            id,
-            response: answer(
-                200,
-                r#"{"client_id":"cid","login":"streamer","scopes":[],"user_id":"9","expires_in":3600}"#,
+    fn a_number_group_signal_carries_its_number() {
+        let (mut t, socket, _) = welcomed(&["cheered"]);
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.hype_train.progress"},"payload":{"event":{"level":3,"total":900,"progress":500,"goal":1000}}}"#
+                    .into(),
             ),
         });
         assert!(
             out.iter()
-                .any(|c| matches!(c, Command::Timer { id, after_ms }
-                if id == "refresh" && *after_ms == 3_540_000)),
-            "an hour less the minute it renews ahead: {out:?}"
-        );
-    }
-
-    #[test]
-    fn a_refused_action_renews_the_token_and_goes_again_once() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "cid".into(),
-                scopes: vec![SCOPE_CHAT.into()],
-                expires_ms: 3_600_000,
-            }),
-            ..Default::default()
-        };
-        let out = t.handle(Event::Call {
-            id: 7,
-            method: "chat".into(),
-            args: vec![Value::Text("hi".into())],
-            from: None,
-        });
-        let call = out
-            .iter()
-            .find_map(|c| match c {
-                Command::Http { id, url, .. } if url == protocol::CHAT_URL => Some(*id),
-                _ => None,
-            })
-            .expect("the chat request");
-        let out = t.handle(Event::Http {
-            id: call,
-            response: answer(401, r#"{"message":"Invalid OAuth token"}"#),
-        });
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH)),
-            "an expiry is not an error: the renewal is read"
-        );
-        let out = t.handle(Event::SecretLoaded {
-            slot: SECRET_REFRESH.into(),
-            value: Some("r1".into()),
-        });
-        let renew = out
-            .iter()
-            .find_map(|c| match c {
-                Command::Http { id, url, .. } if url == protocol::TOKEN_URL => Some(*id),
-                _ => None,
-            })
-            .expect("a renewal");
-        let out = t.handle(Event::Http {
-            id: renew,
-            response: answer(
-                200,
-                r#"{"access_token":"new","refresh_token":"r2","expires_in":3600,"scope":["user:write:chat"]}"#,
-            ),
-        });
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::StoreSecret { slot, value }
-                if slot == SECRET_AUTH && value == "Bearer new")),
-            "the new access token is kept: {out:?}"
-        );
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::StoreSecret { slot, value }
-                if slot == SECRET_REFRESH && value == "r2")),
-            "and Twitch rotated the refresh token, so the new one replaces it"
-        );
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::Http { url, .. } if url == protocol::CHAT_URL)),
-            "the refused action goes again, once, with the new token"
-        );
-        assert!(
-            t.retrying,
-            "and a second refusal will be reported, not renewed"
-        );
-    }
-
-    #[test]
-    fn a_spent_refresh_token_says_what_twitch_said() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "cid".into(),
-                scopes: Vec::new(),
-                expires_ms: 3_600_000,
-            }),
-            ..Default::default()
-        };
-        let out = t.handle(Event::Timer {
-            id: "refresh".into(),
-            at_ms: 0,
-        });
-        assert!(out
-            .iter()
-            .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH)));
-        let out = t.handle(Event::SecretLoaded {
-            slot: SECRET_REFRESH.into(),
-            value: Some("spent".into()),
-        });
-        let renew = out
-            .iter()
-            .find_map(|c| match c {
-                Command::Http { id, url, .. } if url == protocol::TOKEN_URL => Some(*id),
-                _ => None,
-            })
-            .expect("a renewal");
-        let out = t.handle(Event::Http {
-            id: renew,
-            response: answer(
-                400,
-                r#"{"error":"invalid_grant","message":"Invalid refresh token"}"#,
-            ),
-        });
-        assert_eq!(
-            t.error.as_deref(),
-            Some("Invalid refresh token"),
-            "Twitch's own message, not a parse failure"
-        );
-        assert_eq!(t.phase(), &Phase::Off);
-        assert!(
-            out.iter().any(|c| matches!(c, Command::Page { .. })),
-            "the page asks for a new token"
-        );
-    }
-
-    #[test]
-    fn a_group_whose_scope_the_token_lacks_is_named_instead_of_subscribed() {
-        let mut t = Twitch {
-            identity: Some(Identity {
-                id: "1337".into(),
-                login: "streamer".into(),
-                client_id: "client".into(),
-                scopes: Vec::new(),
-                expires_ms: 3_600_000,
-            }),
-            watched: Watched {
-                fields: Vec::new(),
-                signals: vec!["redeemed".into()],
-            },
-            ..Default::default()
-        };
-        let out = t.handle(welcome("s1"));
-        assert!(
-            !out.iter().any(|c| matches!(c, Command::Http { url, .. }
-                if url == protocol::SUBSCRIPTIONS_URL)),
-            "nothing is asked for that Twitch would refuse"
+                .any(|c| matches!(c, Command::Signal { name, value }
+                if name == "hype" && *value == Value::Number(3.0))),
+            "a mapping compares hype_level, hype_progress or hype_goal as numbers: {out:?}"
         );
         assert_eq!(
-            t.missing,
-            vec![(Group::Redeems, "channel:read:redemptions")]
+            t.manifest()
+                .namespace
+                .expect("a namespace")
+                .signals
+                .iter()
+                .find(|s| s.name == "hype")
+                .map(|s| s.payload.clone()),
+            Some(Shape::Number(None)),
+            "and the manifest says so"
         );
-        let page = out.iter().find_map(|c| match c {
-            Command::Page { view, .. } => Some(format!("{view:?}")),
+    }
+
+    #[test]
+    fn a_poll_end_carries_its_winner_and_votes() {
+        let (mut t, socket, _) = welcomed(&["poll_ended"]);
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.poll.end"},"payload":{"event":{"title":"Shoes?","status":"completed","choices":[{"title":"Yeah","votes":120},{"title":"No","votes":140}]}}}"#
+                    .into(),
+            ),
+        });
+        let field = |name: &str| {
+            out.iter().find_map(|c| match c {
+                Command::Field { name: n, value } if n == name => Some(value.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(field("poll_title"), Some(Value::Text("Shoes?".into())));
+        assert_eq!(field("poll_status"), Some(Value::Text("completed".into())));
+        assert_eq!(field("poll_winner"), Some(Value::Text("No".into())));
+        assert_eq!(field("poll_votes"), Some(Value::Number(260.0)));
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::Signal { name, value }
+                if name == "poll_ended" && *value == Value::Text("No".into()))),
+            "the winner is what a mapping matches: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_gift_and_the_streams_own_state_have_their_own_signals() {
+        let (mut t, socket, _) = welcomed(&["gifted", "went_live"]);
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.subscription.gift"},"payload":{"event":{"user_name":"Giver","tier":2000,"total":5}}}"#
+                    .into(),
+            ),
+        });
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::Signal { name, value }
+                if name == "gifted" && *value == Value::Number(5.0))),
+            "five gifts, not five months: {out:?}"
+        );
+        let out = t.handle(Event::Received {
+            id: socket,
+            data: Data::Text(
+                r#"{"metadata":{"message_type":"notification","subscription_type":"stream.online"},"payload":{"event":{"type":"live","started_at":"2020-07-15T17:16:03Z"}}}"#
+                    .into(),
+            ),
+        });
+        let live = out.iter().find_map(|c| match c {
+            Command::Field { name, value } if name == "live" => Some(value.clone()),
             _ => None,
         });
-        assert!(
-            page.as_deref()
-                .is_some_and(|p| p.contains("channel:read:redemptions")),
-            "the page says which scope is missing: {page:?}"
-        );
-    }
-
-    #[test]
-    fn an_expired_token_asks_for_a_renewal_rather_than_showing_a_failure() {
-        let mut t = Twitch::default();
-        // The start path asks who the token belongs to; a 401 means renew.
-        let out = t.handle(Event::SecretLoaded {
-            slot: SECRET_AUTH.into(),
-            value: Some("Bearer x".into()),
-        });
-        let id = out
+        assert_eq!(live, Some(Value::Bool(true)));
+        assert!(out
             .iter()
-            .find_map(|c| match c {
-                Command::Http {
-                    id, method, url, ..
-                } if method == "GET" && url == protocol::VALIDATE_URL => Some(*id),
-                _ => None,
-            })
-            .expect("a users call");
-        let out = t.handle(Event::Http {
-            id,
-            response: answer(401, r#"{"message":"Invalid OAuth token"}"#),
-        });
-        assert!(
-            out.iter()
-                .any(|c| matches!(c, Command::LoadSecret { slot } if slot == SECRET_REFRESH)),
-            "the refresh token is read next, and no failure is shown: {out:?}"
-        );
-        assert!(
-            t.error.is_none(),
-            "an expiry is not something to report: {:?}",
-            t.error
-        );
+            .any(|c| matches!(c, Command::Signal { name, .. } if name == "went_live")));
     }
 }

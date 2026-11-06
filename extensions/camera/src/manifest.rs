@@ -173,5 +173,9 @@ pub(crate) fn build() -> Manifest {
         contacts: false,
         icons: icons::icons(),
         terms: None,
+        status: false,
+        description: env!("CARGO_PKG_DESCRIPTION").into(),
+        documentation: env!("CARGO_PKG_HOMEPAGE").into(),
+        license: env!("CARGO_PKG_LICENSE").into(),
     }
 }
