@@ -80,6 +80,8 @@ const WELCOME_MS: u32 = 30_000;
 const SUB_WINDOW: usize = 4;
 /// Notifications remembered, to count one delivered twice once.
 const SEEN_MAX: usize = 64;
+/// Chat messages it sent, remembered until their echo comes back.
+const OWN_CHAT_MAX: usize = 16;
 /// What a mapping's poll runs for, within Twitch's bounds.
 const POLL_SECONDS: u64 = 300;
 const POLL_MIN_SECONDS: u64 = 15;
@@ -265,6 +267,15 @@ impl Action {
     }
 }
 
+/// A chat message it sent: its text until Twitch answers, then the id
+/// Twitch gave it. Its echo in chat is dropped, so a reply never hears
+/// itself.
+#[derive(Debug, Clone, PartialEq)]
+struct OwnChat {
+    text: String,
+    id: Option<String>,
+}
+
 /// A request as asked, kept so a renewal can repeat it once: a 401 means
 /// Twitch did not do the work, so repeating it is not doing it twice.
 #[derive(Debug, Clone, PartialEq)]
@@ -340,6 +351,7 @@ pub struct Twitch {
     /// The last notifications' ids: Twitch delivers at least once, and both
     /// sockets may carry one during a reconnect.
     seen: VecDeque<String>,
+    own_chat: VecDeque<OwnChat>,
     last: Option<protocol::Fact>,
     error: Option<String>,
     pending: HashMap<u64, Pending>,
@@ -1099,8 +1111,60 @@ impl Twitch {
                 self.error = Some(why);
             }
             Pending::Stream => {}
-            Pending::Action { .. } => self.error = Some(why),
+            Pending::Action {
+                action, request, ..
+            } => {
+                if action == Action::Chat {
+                    self.chat_answered(&request, None);
+                }
+                self.error = Some(why);
+            }
         }
+    }
+
+    /// Twitch answered a chat message it was asked to send: the id it gave
+    /// the message, none when it sent nothing.
+    fn chat_answered(&mut self, request: &Request, id: Option<String>) {
+        let Some(text) = request
+            .content
+            .as_ref()
+            .and_then(|(_, body)| protocol::chat_text(body))
+        else {
+            return;
+        };
+        let Some(at) = self
+            .own_chat
+            .iter()
+            .position(|c| c.id.is_none() && c.text == text)
+        else {
+            return;
+        };
+        match id {
+            Some(id) => self.own_chat[at].id = Some(id),
+            None => {
+                self.own_chat.remove(at);
+            }
+        }
+    }
+
+    /// Whether `fact` is the echo of a chat message it sent: by the id
+    /// Twitch gave it, or by its text while Twitch hasn't answered yet.
+    fn own_echo(&mut self, fact: &protocol::Fact) -> bool {
+        let mine = self
+            .identity
+            .as_ref()
+            .is_some_and(|i| fact.kind == "channel.chat.message" && i.id == fact.user_id);
+        if !mine {
+            return false;
+        }
+        let Some(at) = self.own_chat.iter().position(|c| match &c.id {
+            Some(id) => *id == fact.id,
+            None => c.text == fact.message,
+        }) else {
+            return false;
+        };
+        self.own_chat.remove(at);
+        true
     }
 
     /// Twitch couldn't say what the token is: nothing is known against it, so
@@ -1243,6 +1307,13 @@ impl Twitch {
         request: Request,
         retried: bool,
     ) {
+        if action == Action::Chat && (status != 401 || retried) {
+            let id = match status {
+                200 => protocol::parse_sent_chat(parsed),
+                _ => None,
+            };
+            self.chat_answered(&request, id);
+        }
         let (what, scope) = action.names();
         match status {
             200 | 202 | 204 => self.error = None,
@@ -1413,6 +1484,13 @@ impl Twitch {
                         protocol::chat_body(&identity.id, &identity.id, &message),
                     )),
                 );
+                if self.own_chat.len() >= OWN_CHAT_MAX {
+                    self.own_chat.pop_front();
+                }
+                self.own_chat.push_back(OwnChat {
+                    text: message,
+                    id: None,
+                });
                 out.push(Command::Reply {
                     id,
                     value: Value::Bool(true),
@@ -1592,6 +1670,9 @@ impl Twitch {
                     self.seen.push_back(id);
                 }
                 if let Some(fact) = protocol::decode(&kind, &event) {
+                    if self.own_echo(&fact) {
+                        return;
+                    }
                     match fact.kind.as_str() {
                         "stream.online" => self.stream_live = true,
                         "stream.offline" => self.stream_live = false,
@@ -2386,6 +2467,41 @@ mod tests {
         let carried = carried.expect("a signal");
         assert!(carried.len() <= 64, "{}", carried.len());
         assert_eq!(carried, "é".repeat(32));
+    }
+
+    /// A chat message it sent comes back without a signal, whether its echo
+    /// arrives before Twitch answers the send or after; the person's own
+    /// message from the same account still signals.
+    #[test]
+    fn its_own_chat_messages_never_signal() {
+        let (mut t, socket, _) = welcomed(&["chatted"]);
+        let chat = |t: &mut Twitch, id: u64, text: &str| {
+            let out = t.handle(Event::Call {
+                id,
+                method: "chat".into(),
+                args: vec![Value::Text(text.into())],
+                from: None,
+            });
+            request_to(&out, protocol::CHAT_URL)
+        };
+        let echo = |t: &mut Twitch, message_id: &str, text: &str| {
+            let out = t.handle(Event::Received {
+                id: socket,
+                data: Data::Text(format!(
+                    r#"{{"metadata":{{"message_type":"notification","message_id":"n-{message_id}","subscription_type":"channel.chat.message"}},"payload":{{"event":{{"message_id":"{message_id}","chatter_user_id":"1337","chatter_user_name":"streamer","message":{{"text":"{text}"}}}}}}}}"#
+                )),
+            });
+            out.iter().any(|c| matches!(c, Command::Signal { .. }))
+        };
+        let answered = chat(&mut t, 1, "thanks");
+        t.handle(Event::Http {
+            id: answered,
+            response: answer(200, r#"{"data":[{"message_id":"m1","is_sent":true}]}"#),
+        });
+        assert!(!echo(&mut t, "m1", "thanks"), "its echo after the answer");
+        chat(&mut t, 2, "welcome");
+        assert!(!echo(&mut t, "m2", "welcome"), "its echo before the answer");
+        assert!(echo(&mut t, "m3", "thanks"), "the person typed it themself");
     }
 
     /// A press before Twitch answers doesn't ask twice, and an answer to a

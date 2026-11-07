@@ -36,10 +36,11 @@ pub enum Event {
     ModalClosed { id: String },
     /// A message under one of its read prefixes.
     Osc(OscMessage),
-    /// What the client's enabled rules and their scripts read of it, by the
-    /// names in its own namespace: sent once at start, then whenever the set
-    /// changes. A module subscribes to what is actually used rather than to
-    /// everything it could do.
+    /// What the client's enabled rules and its running scripts read of it,
+    /// by the names in its own namespace: sent once at start, then whenever
+    /// the set changes, a script's uses from its start to its stop. A module
+    /// subscribes to what is actually used rather than to everything it
+    /// could do.
     Watched {
         #[serde(default)]
         fields: Vec<String>,

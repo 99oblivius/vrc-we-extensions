@@ -415,6 +415,30 @@ pub fn parse_validate(body: &Value) -> Result<Identity, String> {
     })
 }
 
+/// The text a `chat_body` carries.
+pub fn chat_text(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The id Twitch gave a chat message it sent; none when it dropped it.
+pub fn parse_sent_chat(body: &Value) -> Option<String> {
+    let sent = body.get("data")?.get(0)?;
+    if !sent
+        .get("is_sent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    sent.get("message_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Twitch's own message for a refused call, when it gives one.
 pub fn parse_error(body: &Value) -> Option<String> {
     body.get("message")
@@ -518,6 +542,9 @@ pub fn parse_frame(text: &str) -> Result<Frame, String> {
 pub struct Fact {
     /// Its subscription type, which is what a mapping conditions on.
     pub kind: String,
+    /// A chat message's id, and the id of who sent it.
+    pub id: String,
+    pub user_id: String,
     pub user: String,
     pub message: String,
     pub reward: String,
@@ -559,6 +586,8 @@ pub fn decode(kind: &str, event: &Value) -> Option<Fact> {
     };
     match kind {
         "channel.chat.message" => {
+            fact.id = text(event, "message_id");
+            fact.user_id = text(event, "chatter_user_id");
             fact.user = text(event, "chatter_user_name");
             fact.message = event
                 .get("message")
