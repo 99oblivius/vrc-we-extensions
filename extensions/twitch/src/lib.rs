@@ -2847,7 +2847,7 @@ mod tests {
         let out = t.handle(Event::Received {
             id: socket,
             data: Data::Text(
-                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.subscription.gift"},"payload":{"event":{"user_name":"Giver","tier":2000,"total":5}}}"#
+                r#"{"metadata":{"message_type":"notification","subscription_type":"channel.subscription.gift"},"payload":{"event":{"user_name":"Giver","tier":"2000","total":5}}}"#
                     .into(),
             ),
         });
@@ -2856,6 +2856,11 @@ mod tests {
                 .any(|c| matches!(c, Command::Signal { name, value }
                 if name == "gifted" && *value == Value::Number(5.0))),
             "five gifts, not five months: {out:?}"
+        );
+        assert_eq!(
+            field(&out, "tier"),
+            Some(Value::Number(2000.0)),
+            "a tier comes as text"
         );
         let out = t.handle(Event::Received {
             id: socket,

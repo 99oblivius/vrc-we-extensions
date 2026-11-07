@@ -573,8 +573,14 @@ fn text(event: &Value, key: &str) -> String {
         .to_owned()
 }
 
+/// A number Twitch sends as JSON, or as text (a subscription's `tier`,
+/// `"1000"` to `"3000"`).
 fn number(event: &Value, key: &str) -> f64 {
-    event.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+    let value = event.get(key);
+    value
+        .and_then(Value::as_f64)
+        .or_else(|| value?.as_str()?.parse().ok())
+        .unwrap_or(0.0)
 }
 
 /// Reads `kind`'s event. A type this build doesn't handle is `None`, not an
