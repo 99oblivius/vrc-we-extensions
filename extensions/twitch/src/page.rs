@@ -91,6 +91,7 @@ pub(crate) fn bar(s: &Snapshot) -> Status {
         tone,
         label,
         icon: Some(LOGO.into()),
+        page: None,
     }
 }
 
@@ -103,6 +104,7 @@ pub(crate) fn view(s: &Snapshot) -> Node {
             tone,
             label,
             icon: Some(LOGO.into()),
+            page: None,
         }),
     ];
     if s.login == Login::In {
@@ -111,6 +113,7 @@ pub(crate) fn view(s: &Snapshot) -> Node {
             tone,
             label: label.into(),
             icon: None,
+            page: None,
         }));
         rows.extend(detail(s).into_iter().map(Node::Text));
     }

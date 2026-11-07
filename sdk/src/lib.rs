@@ -52,7 +52,7 @@ pub trait Extension {
 /// earlier would not read bumps it. So does a manifest field: an older client
 /// would store the manifest without it, then refuse its own record once
 /// updated, since a load compares the two.
-pub const BOUNDARY_VERSION: u32 = 3;
+pub const BOUNDARY_VERSION: u32 = 4;
 
 /// The oldest boundary version the client loads. It rises only to drop
 /// support.
@@ -305,6 +305,7 @@ mod tests {
             tone: Tone::Waiting,
             label: "Waiting".into(),
             icon: Some("logo".into()),
+            page: Some("main".into()),
         };
         let command = Command::Status(Some(status.clone()));
         let text = serde_json::to_string(&command).unwrap();

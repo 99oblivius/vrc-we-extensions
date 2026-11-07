@@ -31,6 +31,10 @@ pub struct Status {
     /// whose it is.
     #[serde(default)]
     pub icon: Option<String>,
+    /// One of the manifest's pages, the one a press on its status bar line
+    /// opens. With none, the first. A view's status isn't pressed.
+    #[serde(default)]
+    pub page: Option<String>,
 }
 
 /// A view: a tree of client widgets the client renders, themes and

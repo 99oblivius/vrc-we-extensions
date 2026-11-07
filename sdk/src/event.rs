@@ -89,6 +89,10 @@ pub enum Event {
     /// person controls in a live session. Sent when it starts and whenever
     /// they change.
     Contacts { list: Vec<Contact> },
+    /// The client's language: the code of a locale it ships, such as `en`,
+    /// `de` or `zh-cn`, for a module that carries its own strings. Sent when
+    /// it starts and whenever the person picks another.
+    Language { code: String },
     /// [`Command::Fire`] `id` answered: the method's reply, none when the
     /// contact refused it, lacks this extension, or the link went down.
     Fired { id: u64, value: Value },

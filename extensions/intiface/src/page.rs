@@ -42,6 +42,7 @@ pub(crate) fn line(state: State) -> Status {
         tone,
         label: label.into(),
         icon: None,
+        page: None,
     }
 }
 
