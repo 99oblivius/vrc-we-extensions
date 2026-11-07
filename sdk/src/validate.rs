@@ -247,6 +247,9 @@ impl Manifest {
         if !self.license.is_empty() && !is_label(&self.license) {
             return Err(ManifestError::BadDetail("license"));
         }
+        if self.docs.len() > DOCS_MAX {
+            return Err(ManifestError::BadDetail("docs"));
+        }
         let mut labels: Vec<&str> = Vec::new();
         for a in &self.actions {
             if !is_label(&a.label) {

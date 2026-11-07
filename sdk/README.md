@@ -31,6 +31,7 @@ client                                   module (wasm32-unknown-unknown)
 | `notifies` | it may post notifications |
 | `status` | it may show a line in the status bar |
 | `description`, `documentation`, `license` | what its details show; `env!("CARGO_PKG_DESCRIPTION")`, `_HOMEPAGE` and `_LICENSE` declare them once |
+| `docs` | its page in the client's Wex docs, in Markdown: how a script uses the namespace, with examples. The client adds the namespace's reference below it. `include_str!("docs.md")` keeps it beside the code |
 | `network` | the hosts, ports and protocols it may reach, and what it may listen on |
 | `log_prefixes` | the game-log lines it may read, which name players |
 | `contacts` | it knows the contacts the person controls and may fire its contact methods on their copy |
@@ -44,7 +45,7 @@ Every count and size has a constant in this crate, and the client enforces it:
 
 | Constant | Value | Bounds |
 |---|---|---|
-| `BOUNDARY_VERSION` | 3 | the boundary this SDK speaks |
+| `BOUNDARY_VERSION` | 5 | the boundary this SDK speaks |
 | `TEXT_MAX` / `LIST_MAX` / `VALUES_MAX` | 4 KiB / 1024 / 16384 | a value, a list, one call's values |
 | `FIELDS_MAX` / `METHODS_MAX` / `SIGNALS_MAX` / `PARAMS_MAX` | 256 / 256 / 64 / 16 | a namespace |
 | `ICONS_MAX` / `ICON_MAX` | 64 / 8 KiB | packaged SVGs |

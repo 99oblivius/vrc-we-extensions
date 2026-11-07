@@ -52,7 +52,7 @@ pub trait Extension {
 /// earlier would not read bumps it. So does a manifest field: an older client
 /// would store the manifest without it, then refuse its own record once
 /// updated, since a load compares the two.
-pub const BOUNDARY_VERSION: u32 = 4;
+pub const BOUNDARY_VERSION: u32 = 5;
 
 /// The oldest boundary version the client loads. It rises only to drop
 /// support.
@@ -269,6 +269,7 @@ mod tests {
             description: String::new(),
             documentation: String::new(),
             license: String::new(),
+            docs: String::new(),
         }
     }
 
@@ -296,6 +297,11 @@ mod tests {
         assert_eq!(
             with(|m| m.license = "x\ny".into()),
             Err(ManifestError::BadDetail("license"))
+        );
+        assert_eq!(with(|m| m.docs = "## Use\n\nx".repeat(100)), Ok(()));
+        assert_eq!(
+            with(|m| m.docs = "x".repeat(DOCS_MAX + 1)),
+            Err(ManifestError::BadDetail("docs"))
         );
     }
 
@@ -1371,6 +1377,17 @@ mod tests {
         assert!(
             older.secrets.is_empty(),
             "a manifest from before secrets declares none"
+        );
+    }
+
+    #[test]
+    fn a_manifest_from_before_the_docs_page_declares_none() {
+        let mut json = serde_json::to_value(manifest(ns())).unwrap();
+        json.as_object_mut().unwrap().remove("docs");
+        let older: Manifest = serde_json::from_value(json).unwrap();
+        assert!(
+            older.docs.is_empty(),
+            "a manifest from before the docs page has none"
         );
     }
 

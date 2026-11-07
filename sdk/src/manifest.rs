@@ -72,6 +72,14 @@ pub struct Manifest {
     /// reads it.
     #[serde(default)]
     pub license: String,
+    /// Its page in the client's Wex docs, in Markdown, at most [`DOCS_MAX`]
+    /// bytes: how a script uses its namespace, with examples. Its `## `
+    /// headings are the page's contents. The client titles the page with
+    /// the namespace and lists the namespace's fields, methods and signals
+    /// below it, so the page explains rather than lists. Shown only for a
+    /// manifest with a namespace.
+    #[serde(default)]
+    pub docs: String,
 }
 
 /// `env!("CARGO_PKG_AUTHORS")` in the form a repository's index lists it, so a
@@ -84,6 +92,8 @@ pub fn cargo_authors(authors: &str) -> String {
 pub const DESCRIPTION_MAX: usize = 1024;
 /// The longest documentation address a manifest may carry, in bytes.
 pub const DOCUMENTATION_MAX: usize = 2048;
+/// The longest Wex docs page a manifest may carry, in bytes.
+pub const DOCS_MAX: usize = 32 << 10;
 
 /// An extension's own terms, or those of a service it uses: what the person
 /// accepts before installing it. The text travels inline when it is short, and

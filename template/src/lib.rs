@@ -140,6 +140,7 @@ impl Extension for Template {
             description: env!("CARGO_PKG_DESCRIPTION").into(),
             documentation: env!("CARGO_PKG_HOMEPAGE").into(),
             license: env!("CARGO_PKG_LICENSE").into(),
+            docs: include_str!("docs.md").into(),
         }
     }
 
