@@ -60,6 +60,12 @@ pub struct Manifest {
     /// It shows a line in the client's status bar ([`Command::Status`]).
     #[serde(default)]
     pub status: bool,
+    /// It reads the game facts ([`Event::Game`]).
+    #[serde(default)]
+    pub game: bool,
+    /// It reads player names in [`Game::players`]; requires `game`.
+    #[serde(default)]
+    pub players: bool,
     /// What it does, for its details: at most [`DESCRIPTION_MAX`] bytes.
     /// `env!("CARGO_PKG_DESCRIPTION")` keeps it the one its listing shows.
     #[serde(default)]

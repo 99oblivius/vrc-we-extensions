@@ -250,6 +250,9 @@ impl Manifest {
         if self.docs.len() > DOCS_MAX {
             return Err(ManifestError::BadDetail("docs"));
         }
+        if self.players && !self.game {
+            return Err(ManifestError::BadDetail("players"));
+        }
         let mut labels: Vec<&str> = Vec::new();
         for a in &self.actions {
             if !is_label(&a.label) {

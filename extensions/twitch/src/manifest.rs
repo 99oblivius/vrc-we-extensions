@@ -284,6 +284,8 @@ pub(crate) fn build() -> Manifest {
             ..vrc_we_sdk::Terms::default()
         }),
         status: true,
+        game: false,
+        players: false,
         description: env!("CARGO_PKG_DESCRIPTION").into(),
         documentation: env!("CARGO_PKG_HOMEPAGE").into(),
         license: env!("CARGO_PKG_LICENSE").into(),

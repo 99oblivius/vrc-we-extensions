@@ -173,21 +173,68 @@ pub enum Command {
         method: String,
         args: Vec<Value>,
     },
+    /// Shows the person a picker for one file and answers with what they
+    /// chose: its name and bytes (at most [`FILE_MAX`]), none on cancel, or
+    /// an error when it was too large or unreadable.
+    PickFile {
+        id: u64,
+        #[serde(default)]
+        filter: Option<FileFilter>,
+    },
+    /// Shows the person a save picker, its name `name`, and writes `data`
+    /// (at most [`FILE_MAX`] bytes) where they choose.
+    SaveFile {
+        id: u64,
+        name: String,
+        data: Data,
+    },
     /// Shows a notification for `seconds` (at most
     /// [`NOTIFY_SECONDS_MAX`]), if the manifest says it notifies. The
     /// title is a label; the body at most [`NOTIFY_BODY_MAX`] bytes.
+    /// `buttons` are pressed through [`Event::Ui`] with an empty page and
+    /// the button's id.
     Notify {
         title: String,
         body: String,
         seconds: u32,
+        #[serde(default)]
+        buttons: Vec<NotifyButton>,
     },
     /// Its line in the client's status bar, none to take it away, if the
     /// manifest says it shows one. The latest wins.
     Status(Option<Status>),
 }
 
+/// A button on an extension's notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotifyButton {
+    /// The id [`Event::Ui`] names when it is pressed.
+    pub id: String,
+    /// What the button reads.
+    pub label: String,
+}
+
+/// What a file picker's filter offers: a label and its extensions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileFilter {
+    pub name: String,
+    pub extensions: Vec<String>,
+}
+
+/// The largest file a pick returns or a save writes.
+pub const FILE_MAX: usize = 512 << 10;
+
+/// The longest file name a save starts with.
+pub const FILE_NAME_MAX: usize = 128;
+
+/// The most extensions one filter names.
+pub const FILE_EXTENSIONS_MAX: usize = 8;
+
 /// The longest a notification stays up, in seconds.
 pub const NOTIFY_SECONDS_MAX: u32 = 300;
+
+/// The most buttons a notification carries.
+pub const NOTIFY_BUTTONS_MAX: usize = 3;
 
 /// The longest notification body, in bytes.
 pub const NOTIFY_BODY_MAX: usize = 1024;

@@ -135,6 +135,8 @@ impl Extension for Template {
             terms: None,
             // A line in the client's status bar (`Command::Status`).
             status: false,
+            game: false,
+            players: false,
             // Set in Cargo.toml, which the repository's listing reads too. Its
             // homepage is where the extension's details link to.
             description: env!("CARGO_PKG_DESCRIPTION").into(),

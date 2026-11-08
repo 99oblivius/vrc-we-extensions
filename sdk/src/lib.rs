@@ -52,7 +52,7 @@ pub trait Extension {
 /// earlier would not read bumps it. So does a manifest field: an older client
 /// would store the manifest without it, then refuse its own record once
 /// updated, since a load compares the two.
-pub const BOUNDARY_VERSION: u32 = 5;
+pub const BOUNDARY_VERSION: u32 = 6;
 
 /// The oldest boundary version the client loads. It rises only to drop
 /// support.
@@ -266,6 +266,8 @@ mod tests {
             terms: None,
             contacts: false,
             status: false,
+            game: false,
+            players: false,
             description: String::new(),
             documentation: String::new(),
             license: String::new(),
@@ -1165,6 +1167,15 @@ mod tests {
         m.pages[0].id = "two words".into();
         assert!(matches!(m.validate(), Err(ManifestError::BadName(_))));
         assert!(manifest(ns()).has_page("main"));
+    }
+
+    #[test]
+    fn players_need_the_game_grant() {
+        let mut m = manifest(ns());
+        m.players = true;
+        assert_eq!(m.validate(), Err(ManifestError::BadDetail("players")));
+        m.game = true;
+        assert_eq!(m.validate(), Ok(()));
     }
 
     #[test]

@@ -26,6 +26,21 @@ pub enum Event {
     /// What [`Command::Load`] found under `key`; none when nothing was
     /// stored.
     Loaded { key: String, value: Option<String> },
+    /// What [`Command::PickFile`] found: the file's name and bytes, none on
+    /// cancel, or `error` when it was too large or unreadable.
+    Picked {
+        id: u64,
+        file: Option<PickedFile>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// What [`Command::SaveFile`] did: `ok`, or `error` with why not.
+    Saved {
+        id: u64,
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
     /// What [`Command::LoadSecret`] found in slot `slot`; none when nothing
     /// was stored, when the slot was not declared or Settings switched it
     /// off, or when the client has no keyring to read.
@@ -94,6 +109,10 @@ pub enum Event {
     /// `de` or `zh-cn`, for a module that carries its own strings. Sent when
     /// it starts and whenever the person picks another.
     Language { code: String },
+    /// The game facts it declared (`Manifest::game`): sent when it starts
+    /// and whenever they change. Player names are empty unless the manifest
+    /// also declares `players`.
+    Game(Game),
     /// [`Command::Fire`] `id` answered: the method's reply, none when the
     /// contact refused it, lacks this extension, or the link went down.
     Fired { id: u64, value: Value },
@@ -115,4 +134,41 @@ pub enum Event {
         label: String,
         data: Value,
     },
+}
+
+/// A file the person chose, its name and bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PickedFile {
+    pub name: String,
+    pub data: Data,
+}
+
+/// What the client knows of the running game, for a module that declares
+/// [`Manifest::game`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Game {
+    pub in_instance: bool,
+    /// The world's id, `wrld_…`, when in one.
+    pub world: Option<String>,
+    pub kind: Option<GameKind>,
+    /// The worn avatar's id, `avtr_…`.
+    pub avatar: Option<String>,
+    /// The armed profile's id.
+    pub profile: Option<String>,
+    /// Everyone in the instance, the local player included; empty unless
+    /// the manifest declares [`Manifest::players`].
+    pub players: Vec<String>,
+    /// The local player's display name, when known.
+    pub self_player: Option<String>,
+}
+
+/// The instance kind, as the game reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameKind {
+    Public,
+    FriendsPlus,
+    Friends,
+    InvitePlus,
+    Invite,
+    Group,
 }

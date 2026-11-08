@@ -16,6 +16,8 @@ client                                   module (wasm32-unknown-unknown)
 - The module exports two functions the host calls: `vrcwe_alloc(len) -> ptr` and `vrcwe_handle(ptr, len) -> packed`. `vrc_we_sdk::export!(YourType)` writes both, so a crate becomes an extension by implementing `Extension` and calling the macro.
 - One event in, a list of commands out, per call. A module never blocks, never reads a clock, and opens nothing. Every effect is a command the host performs after checking it against the manifest.
 - The module is a pure state machine. State that must survive a restart goes through `Command::Store`. State that must survive a reinstall lives in the client's keyring through `Command::StoreSecret`.
+- A file pick is `Command::PickFile`: the person's choice arrives as `Event::Picked` with its name and bytes, at most `FILE_MAX`; `Command::SaveFile` writes what the module gives. A module never sees a path.
+- A notification (`Command::Notify`) may carry up to `NOTIFY_BUTTONS_MAX` buttons. A press arrives as `Event::Ui` with an empty page and the button's id.
 
 ## What a module declares
 
@@ -30,6 +32,8 @@ client                                   module (wasm32-unknown-unknown)
 | `secrets` | the keyring slots it may keep, by name |
 | `notifies` | it may post notifications |
 | `status` | it may show a line in the status bar |
+| `game` | it reads the game facts (`Event::Game`): world, instance kind, worn avatar, armed profile |
+| `players` | it also reads player names in `Game::players`; requires `game` |
 | `description`, `documentation`, `license` | what its details show; `env!("CARGO_PKG_DESCRIPTION")`, `_HOMEPAGE` and `_LICENSE` declare them once |
 | `docs` | its page in the client's Wex docs, in Markdown: how a script uses the namespace, with examples. The client adds the namespace's reference below it. `include_str!("docs.md")` keeps it beside the code |
 | `network` | the hosts, ports and protocols it may reach, and what it may listen on |
@@ -45,7 +49,7 @@ Every count and size has a constant in this crate, and the client enforces it:
 
 | Constant | Value | Bounds |
 |---|---|---|
-| `BOUNDARY_VERSION` | 5 | the boundary this SDK speaks |
+| `BOUNDARY_VERSION` | 6 | the boundary this SDK speaks |
 | `TEXT_MAX` / `LIST_MAX` / `VALUES_MAX` | 4 KiB / 1024 / 16384 | a value, a list, one call's values |
 | `FIELDS_MAX` / `METHODS_MAX` / `SIGNALS_MAX` / `PARAMS_MAX` | 256 / 256 / 64 / 16 | a namespace |
 | `ICONS_MAX` / `ICON_MAX` | 64 / 8 KiB | packaged SVGs |
@@ -53,6 +57,8 @@ Every count and size has a constant in this crate, and the client enforces it:
 | `NET_GRANTS_MAX` / `NET_BODY_MAX` / `NET_OPEN_MAX` | 16 / 1 MiB / 16 | network |
 | `STORE_KEYS_MAX` / `STORE_VALUE_MAX` / `STORE_MAX` | 1024 / 1 MiB / 64 MiB | the store |
 | `SECRETS_MAX` / `SECRET_MAX` | 16 / 4 KiB | keyring |
+| `FILE_MAX` / `FILE_NAME_MAX` | 512 KiB / 128 | a picked or saved file |
+| `NOTIFY_BUTTONS_MAX` | 3 | buttons on a notification |
 | `CALLS_MAX` / `CONTACT_CALLS_MAX` | 256 / 64 | calls in flight |
 
 The client's sandbox adds what a module cannot lift: a memory cap, fuel slices between which other work runs, and one green thread per extension.
