@@ -68,15 +68,31 @@ pub(crate) const MODES: [&str; 7] = [
     "Drone",
 ];
 
-/// VRChat's camera sliders (2025.3.3): field, OSC name, label, range, and
-/// the default those notes give. VRChat sends no update when one moves:
-/// the client reads its value from VRChat's OSCQuery tree when this starts,
-/// and until then a slider reads its default. The notes give
-/// Lightness 0–50 with a default of 60; it takes 0–100 and 50 until
+/// VRChat's camera sliders (2025.3.3): field, OSC name, label, range, the
+/// default those notes give, and the field's summary. VRChat sends no update
+/// when one moves: the client reads its value from VRChat's OSCQuery tree
+/// when this starts, and until then a slider reads its default. The notes
+/// give Lightness 0–50 with a default of 60; it takes 0–100 and 50 until
 /// VRChat's own range is checked.
-pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64); 14] = [
-    ("zoom", "Zoom", "Zoom", 20.0, 300.0, 45.0),
-    ("exposure", "Exposure", "Exposure", -10.0, 4.0, 0.0),
+pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64, &str); 14] = [
+    (
+        "zoom",
+        "Zoom",
+        "Zoom",
+        20.0,
+        300.0,
+        45.0,
+        "The camera's field of view",
+    ),
+    (
+        "exposure",
+        "Exposure",
+        "Exposure",
+        -10.0,
+        4.0,
+        0.0,
+        "How bright the image is",
+    ),
     (
         "focal_distance",
         "FocalDistance",
@@ -84,11 +100,44 @@ pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64); 14] = [
         0.0,
         10.0,
         1.5,
+        "Distance in focus, with manual focus",
     ),
-    ("aperture", "Aperture", "Aperture", 1.4, 32.0, 15.0),
-    ("hue", "Hue", "Hue", 0.0, 360.0, 120.0),
-    ("saturation", "Saturation", "Saturation", 0.0, 100.0, 100.0),
-    ("lightness", "Lightness", "Lightness", 0.0, 100.0, 50.0),
+    (
+        "aperture",
+        "Aperture",
+        "Aperture",
+        1.4,
+        32.0,
+        15.0,
+        "Depth of field aperture",
+    ),
+    (
+        "hue",
+        "Hue",
+        "Hue",
+        0.0,
+        360.0,
+        120.0,
+        "Green screen colour's hue",
+    ),
+    (
+        "saturation",
+        "Saturation",
+        "Saturation",
+        0.0,
+        100.0,
+        100.0,
+        "Green screen colour's saturation",
+    ),
+    (
+        "lightness",
+        "Lightness",
+        "Lightness",
+        0.0,
+        100.0,
+        50.0,
+        "Green screen colour's lightness",
+    ),
     (
         "look_at_me_x_offset",
         "LookAtMeXOffset",
@@ -96,6 +145,7 @@ pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64); 14] = [
         -25.0,
         25.0,
         0.0,
+        "Look-at-me image shift, sideways",
     ),
     (
         "look_at_me_y_offset",
@@ -104,9 +154,26 @@ pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64); 14] = [
         -25.0,
         25.0,
         0.0,
+        "Look-at-me image shift, up or down",
     ),
-    ("fly_speed", "FlySpeed", "Fly speed", 0.1, 15.0, 3.0),
-    ("turn_speed", "TurnSpeed", "Turn speed", 0.1, 5.0, 1.0),
+    (
+        "fly_speed",
+        "FlySpeed",
+        "Fly speed",
+        0.1,
+        15.0,
+        3.0,
+        "How fast the camera moves when flying",
+    ),
+    (
+        "turn_speed",
+        "TurnSpeed",
+        "Turn speed",
+        0.1,
+        5.0,
+        1.0,
+        "How fast the camera turns when flying",
+    ),
     (
         "smoothing_strength",
         "SmoothingStrength",
@@ -114,9 +181,26 @@ pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64); 14] = [
         0.1,
         10.0,
         5.0,
+        "How much camera movement is smoothed",
     ),
-    ("photo_rate", "PhotoRate", "Photo rate", 0.1, 2.0, 1.0),
-    ("duration", "Duration", "Duration", 0.1, 60.0, 2.0),
+    (
+        "photo_rate",
+        "PhotoRate",
+        "Photo rate",
+        0.1,
+        2.0,
+        1.0,
+        "The dolly's photo capture rate",
+    ),
+    (
+        "duration",
+        "Duration",
+        "Duration",
+        0.1,
+        60.0,
+        2.0,
+        "How long a new dolly point takes",
+    ),
 ];
 
 /// The sliders a key holds ([`motion::Optics`]), in a step's order.
@@ -127,54 +211,138 @@ pub(crate) const OPTIC_FIELDS: [&str; 4] = ["zoom", "focal_distance", "aperture"
 pub(crate) const SMOOTH_MOVEMENT: &str = "smooth_movement";
 pub(crate) const SMOOTHING_STRENGTH: &str = "smoothing_strength";
 
-/// VRChat's camera toggles (2025.3.3): field, OSC name, label, and the
-/// value it reads until VRChat's is known (the client reads it when this
-/// starts) or it is set here. VRChat documents no defaults: these are
+/// VRChat's camera toggles (2025.3.3): field, OSC name, label, the value
+/// it reads until VRChat's is known (the client reads it when this
+/// starts) or it is set here, and the field's summary. VRChat documents
+/// no defaults: these are
 /// a fresh camera's as chosen here (every layer shown, landscape, the
 /// rest off).
-pub(crate) const TOGGLES: [(&str, &str, &str, bool); 18] = [
-    ("show_ui_in_camera", "ShowUIInCamera", "UI in camera", false),
-    ("lock", "Lock", "Lock", false),
-    ("local_player", "LocalPlayer", "Local player", true),
-    ("remote_player", "RemotePlayer", "Remote players", true),
-    ("environment", "Environment", "Environment", true),
-    ("green_screen", "GreenScreen", "Green screen", false),
+pub(crate) const TOGGLES: [(&str, &str, &str, bool, &str); 18] = [
+    (
+        "show_ui_in_camera",
+        "ShowUIInCamera",
+        "UI in camera",
+        false,
+        "Photos include the interface",
+    ),
+    (
+        "lock",
+        "Lock",
+        "Lock",
+        false,
+        "Stops the camera being picked up (VR)",
+    ),
+    (
+        "local_player",
+        "LocalPlayer",
+        "Local player",
+        true,
+        "Photos include you",
+    ),
+    (
+        "remote_player",
+        "RemotePlayer",
+        "Remote players",
+        true,
+        "Photos include other players",
+    ),
+    (
+        "environment",
+        "Environment",
+        "Environment",
+        true,
+        "Photos include the world",
+    ),
+    (
+        "green_screen",
+        "GreenScreen",
+        "Green screen",
+        false,
+        "A green screen replaces the world",
+    ),
     (
         "smooth_movement",
         "SmoothMovement",
         "Smooth movement",
         false,
+        "Smooths the camera's movement",
     ),
-    ("look_at_me", "LookAtMe", "Look at me", false),
-    ("auto_level_roll", "AutoLevelRoll", "Level roll", false),
-    ("auto_level_pitch", "AutoLevelPitch", "Level pitch", false),
-    ("flying", "Flying", "Flying", false),
+    (
+        "look_at_me",
+        "LookAtMe",
+        "Look at me",
+        false,
+        "The camera follows where your head faces",
+    ),
+    (
+        "auto_level_roll",
+        "AutoLevelRoll",
+        "Level roll",
+        false,
+        "Keeps the camera's roll level",
+    ),
+    (
+        "auto_level_pitch",
+        "AutoLevelPitch",
+        "Level pitch",
+        false,
+        "Keeps the camera's pitch level",
+    ),
+    (
+        "flying",
+        "Flying",
+        "Flying",
+        false,
+        "The camera flies apart from your avatar",
+    ),
     (
         "trigger_takes_photos",
         "TriggerTakesPhotos",
         "Trigger takes photos",
         false,
+        "The controller trigger takes photos",
     ),
     (
         "dolly_paths_stay_visible",
         "DollyPathsStayVisible",
         "Dolly paths visible",
         false,
+        "Dolly paths stay shown",
     ),
-    ("camera_ears", "CameraEars", "Camera ears", false),
-    ("show_focus", "ShowFocus", "Show focus", false),
-    ("streaming", "Streaming", "Streaming", false),
+    (
+        "camera_ears",
+        "CameraEars",
+        "Camera ears",
+        false,
+        "Audio comes from the camera's position",
+    ),
+    (
+        "show_focus",
+        "ShowFocus",
+        "Show focus",
+        false,
+        "Shows where the camera focuses",
+    ),
+    (
+        "streaming",
+        "Streaming",
+        "Streaming",
+        false,
+        "Sends the view out over Spout",
+    ),
     (
         "roll_while_flying",
         "RollWhileFlying",
         "Roll while flying",
         false,
+        "The camera rolls while flying (VR)",
     ),
     (
         "orientation_is_landscape",
         "OrientationIsLandscape",
         "Landscape",
         true,
+        "Landscape, not portrait",
     ),
 ];
 
@@ -653,7 +821,7 @@ impl Camera {
     /// It goes out with the tick's others ([`SEND_SETTINGS`]); an unchanged
     /// value sends nothing.
     fn send_slider(&mut self, i: usize, v: f32, out: &mut Vec<Command>) {
-        let (_, _, _, lo, hi, _) = SLIDERS[i];
+        let (_, _, _, lo, hi, ..) = SLIDERS[i];
         let v = v.clamp(lo as f32, hi as f32);
         if self.sliders[i] == v && !self.sliders_due.contains(&i) {
             return;

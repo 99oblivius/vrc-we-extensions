@@ -1,5 +1,5 @@
-`@TWITCH` is your channel: what happens on it, and what a script can do
-there. Sign in on the Twitch page first.
+`@TWITCH` reads what happens on your Twitch channel and acts on it. Sign
+in on the Twitch page first.
 
 ## Reacting to events
 
@@ -29,8 +29,8 @@ reply can't answer itself. What you type yourself does.
 
 A field holds the latest event's value, whatever kind it was. Inside an
 `on` block those are its own event's values, from the block's first line
-until something newer lands. Take the ones you need into names at the top
-of the block, and they stay yours:
+until a newer event arrives. Set the ones you need to variables at the
+top of the block, and they keep their values:
 
 ```
 on @TWITCH.subscribed {
@@ -41,7 +41,7 @@ on @TWITCH.subscribed {
 ```
 
 `cheered` compares its bits as a number, and `@TWITCH.bits` holds that same
-number. A hundred bits is worth a shout:
+number. This block answers cheers of 100 bits or more:
 
 ```
 on @TWITCH.cheered >= 100 {
@@ -51,10 +51,10 @@ on @TWITCH.cheered >= 100 {
 }
 ```
 
-A `wait` or a `launch` gives other events time to land, and a field read
-after it holds whatever landed last. The bound names keep their values, so
-bind first: without the first line, `{who}` can be someone else by the time
-the chat goes out.
+During a `wait` or after a `launch`, other events can arrive, and a field
+read after it holds the latest one. Variables keep their values, so set
+them first: without the first line, `{who}` can be someone else by the
+time the chat message is sent.
 
 ## A command in chat
 
@@ -85,10 +85,10 @@ on @TWITCH.redeemed is "Dance" {
 }
 ```
 
-## A welcome that takes its time
+## Passing values to a recipe
 
-The values a recipe needs travel in its arguments. Bind them, launch the
-recipe, and it works from its own copy however long it waits:
+Pass a recipe the values it needs as arguments. Its parameters are
+copies, so they keep their values however long it waits:
 
 ```
 recipe welcome(who, months) {
@@ -106,13 +106,13 @@ on @TWITCH.subscribed {
 }
 ```
 
-## A block that keeps listening
+## An on inside an on
 
 An `on` inside an `on` starts when the outer block reaches it, and stops
-with that block. Each one reads the event it is about: the outer bound
-`who` stays the subscriber, while the inner block binds its own cheerer.
-A second subscriber during that minute restarts the outer block, whose
-`who` is the new one.
+when that block ends. Each one reads its own event: the outer `who` stays
+the subscriber, while the inner block sets `fan` to the cheerer. A second
+subscriber during that minute restarts the outer block, with the new
+subscriber as `who`.
 
 ```
 on @TWITCH.subscribed {
@@ -144,7 +144,7 @@ on @TWITCH.went_live {
 }
 ```
 
-## Small events
+## More events
 
 `gifted` carries the number of subs, `hype` the level, `polled` the
 title, and `followed` and `went_offline` carry nothing:
@@ -206,8 +206,8 @@ nothing.
 
 ## Acting on the channel
 
-Each method gives true once Twitch has been asked, and false when it
-refuses to ask: not signed in, or an empty message. Why is in
+Each method gives true once the request is sent to Twitch, and false when
+it can't be sent: not signed in, or an empty message. Why is in
 `@TWITCH.error`. A text longer than the reference allows never reaches the
 extension: that call reads none.
 
@@ -216,10 +216,12 @@ extension: that call reads none.
 - `clip()`, `clip(title)`: a clip of the last 30 seconds.
 - `marker()`, `marker(description)`: a stream marker.
 - `title(title)`: the stream title, up to 140 bytes.
-- `commercial()`, `commercial(seconds)`: a commercial, 60 seconds unless you
-  say, 30 to 180 in 30 second steps.
-- `poll(title, first, second)`: a poll, two to five choices, then its
-  seconds: 5 minutes unless you say, 15 to 1800.
+- `commercial()`, `commercial(seconds)`: a commercial, 60 seconds unless
+  given, 30 to 180 in 30 second steps.
+- `poll(title, first, second, third, fourth, fifth, seconds)`: a poll of
+  two to five choices, then its seconds: 5 minutes unless given, 15 to
+  1800. Leave out the choices you don't need; to give seconds with fewer
+  choices, pass `""` for the unused ones.
 
 ```
 on @TWITCH.chatted is "!clip" {
@@ -228,6 +230,7 @@ on @TWITCH.chatted is "!clip" {
 run @TWITCH.marker("chapter two")
 run @TWITCH.commercial(60)
 run @TWITCH.poll("Shoes?", "Yes", "No")
+run @TWITCH.poll("Song?", "Fast", "Slow", "", "", "", 60)
 ```
 
 A call that fails says why in `@TWITCH.error`, and a later success clears
@@ -243,7 +246,7 @@ on @TWITCH.error changes {
 
 ## When it listens
 
-Twitch listens for an event only while something uses it: a mapping's
-trigger, or a running script. The first events after a script starts may
+An event is received only while something uses it: a mapping's trigger,
+or a running script. The first events after a script starts may
 take a second to arrive. An event the sign-in didn't grant shows on the
 Twitch page with the permission it needs.

@@ -76,12 +76,14 @@ impl Extension for Template {
                         shape: Shape::Number(None),
                         writable: false,
                         shared: true,
+                        summary: "The total the adds have reached".into(),
                     },
                     Field {
                         name: "armed".into(),
                         shape: Shape::Bool,
                         writable: true,
                         shared: false,
+                        summary: "Whether the page's switch is on".into(),
                     },
                 ],
                 methods: vec![Method {
@@ -96,6 +98,7 @@ impl Extension for Template {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Adds n to the count and gives the new count".into(),
                 }],
                 signals: vec![Signal {
                     name: "reset".into(),

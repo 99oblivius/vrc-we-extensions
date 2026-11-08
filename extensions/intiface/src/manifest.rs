@@ -8,12 +8,13 @@ use vrc_we_sdk::{
 
 use crate::{PAGE, SECONDS_MAX};
 
-fn field(name: &str, shape: Shape) -> Field {
+fn field(name: &str, shape: Shape, summary: &str) -> Field {
     Field {
         name: name.into(),
         shape,
         writable: false,
         shared: true,
+        summary: summary.into(),
     }
 }
 
@@ -43,6 +44,7 @@ pub(crate) fn build() -> Manifest {
         coroutine: true,
         moves: Vec::new(),
         contacts: true,
+        summary: "Vibrates the named device, or all, for seconds".into(),
     };
     let stop = Method {
         name: "stop".into(),
@@ -51,6 +53,7 @@ pub(crate) fn build() -> Manifest {
         coroutine: false,
         moves: Vec::new(),
         contacts: true,
+        summary: "Stops every device".into(),
     };
     Manifest {
         name: env!("CARGO_PKG_NAME").into(),
@@ -59,9 +62,17 @@ pub(crate) fn build() -> Manifest {
         namespace: Some(Namespace {
             name: "INTIFACE".into(),
             fields: vec![
-                field("connected", Shape::Bool),
-                field("devices", Shape::Number(None)),
-                field("level", unit),
+                field(
+                    "connected",
+                    Shape::Bool,
+                    "Whether the Intiface server is connected",
+                ),
+                field(
+                    "devices",
+                    Shape::Number(None),
+                    "How many devices the server has connected",
+                ),
+                field("level", unit, "The strongest vibration running, 0 to 1"),
             ],
             methods: vec![vibrate, stop],
             signals: Vec::new(),
@@ -112,6 +123,6 @@ pub(crate) fn build() -> Manifest {
         description: env!("CARGO_PKG_DESCRIPTION").into(),
         documentation: env!("CARGO_PKG_HOMEPAGE").into(),
         license: env!("CARGO_PKG_LICENSE").into(),
-        docs: String::new(),
+        docs: include_str!("docs.md").into(),
     }
 }

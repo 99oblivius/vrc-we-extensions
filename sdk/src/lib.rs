@@ -52,7 +52,7 @@ pub trait Extension {
 /// earlier would not read bumps it. So does a manifest field: an older client
 /// would store the manifest without it, then refuse its own record once
 /// updated, since a load compares the two.
-pub const BOUNDARY_VERSION: u32 = 6;
+pub const BOUNDARY_VERSION: u32 = 7;
 
 /// The oldest boundary version the client loads. It rises only to drop
 /// support.
@@ -164,6 +164,7 @@ mod tests {
             shape: Shape::Number(range),
             writable,
             shared: false,
+            summary: String::new(),
         }
     }
 
@@ -200,6 +201,7 @@ mod tests {
                     moves: vec!["level".into()],
                     coroutine: false,
                     contacts: false,
+                    summary: String::new(),
                 },
                 Method {
                     name: "post".into(),
@@ -227,6 +229,7 @@ mod tests {
                     moves: Vec::new(),
                     coroutine: false,
                     contacts: false,
+                    summary: String::new(),
                 },
             ],
             signals: vec![Signal {
@@ -304,6 +307,32 @@ mod tests {
         assert_eq!(
             with(|m| m.docs = "x".repeat(DOCS_MAX + 1)),
             Err(ManifestError::BadDetail("docs"))
+        );
+    }
+
+    /// A summary is one hover line: counted in characters, not bytes.
+    #[test]
+    fn a_summary_is_one_line_of_at_most_its_characters() {
+        let with = |set: fn(&mut Namespace)| {
+            let mut n = ns();
+            set(&mut n);
+            n.validate()
+        };
+        assert_eq!(
+            with(|n| n.fields[0].summary = "é".repeat(SUMMARY_MAX)),
+            Ok(())
+        );
+        assert_eq!(
+            with(|n| n.fields[0].summary = "x".repeat(SUMMARY_MAX + 1)),
+            Err(ManifestError::BadSummary("level".into()))
+        );
+        assert_eq!(
+            with(|n| n.methods[1].summary = "Posts\nit".into()),
+            Err(ManifestError::BadSummary("post".into()))
+        );
+        assert_eq!(
+            with(|n| n.methods[0].summary = " ".into()),
+            Err(ManifestError::BadSummary("nudge".into()))
         );
     }
 
@@ -1327,6 +1356,7 @@ mod tests {
             moves: Vec::new(),
             coroutine: false,
             contacts: false,
+            summary: String::new(),
         });
         assert_eq!(
             n.check_call("paint", vec![]),

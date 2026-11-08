@@ -31,6 +31,7 @@ pub(crate) fn build() -> Manifest {
         moves: moves.iter().map(|m| (*m).to_owned()).collect(),
         coroutine,
         contacts: !matches!(name, "track" | "position" | "add_key"),
+        summary: method_summary(name).to_owned(),
     };
     let axes = |names: [&str; 3], limit: f64| {
         names
@@ -59,27 +60,32 @@ pub(crate) fn build() -> Manifest {
     };
     // Only what VRChat reports is shared: a slider or a toggle reads
     // what was last set on this client.
-    let field = |name: &str, shape, shared| Field {
+    let field = |name: &str, shape, shared, summary: &str| Field {
         name: name.to_owned(),
         shape,
         writable: true,
         shared,
+        summary: summary.to_owned(),
     };
     let mut fields: Vec<Field> = POSE_FIELDS
         .iter()
-        .map(|f| field(f, Shape::Number(None), true))
+        .zip(POSE_SUMMARIES)
+        .map(|(f, summary)| field(f, Shape::Number(None), true, summary))
         .collect();
     fields.push(field(
         "mode",
         Shape::Number(Some(Range::new(0.0, 6.0))),
         true,
+        "Camera mode, 0 Off through 6 Drone",
     ));
+    fields.extend(SLIDERS.iter().map(|(f, _, _, lo, hi, _, summary)| {
+        field(f, Shape::Number(Some(Range::new(*lo, *hi))), false, summary)
+    }));
     fields.extend(
-        SLIDERS
+        TOGGLES
             .iter()
-            .map(|(f, _, _, lo, hi, _)| field(f, Shape::Number(Some(Range::new(*lo, *hi))), false)),
+            .map(|(f, _, _, _, summary)| field(f, Shape::Bool, false, summary)),
     );
-    fields.extend(TOGGLES.iter().map(|(f, ..)| field(f, Shape::Bool, false)));
     let (moves, turns) = (["dx", "dy", "dz"], ["dpitch", "dyaw", "droll"]);
     let (at, facing) = (&["x", "y", "z"], &["pitch", "yaw", "roll"]);
     Manifest {
@@ -179,6 +185,35 @@ pub(crate) fn build() -> Manifest {
         description: env!("CARGO_PKG_DESCRIPTION").into(),
         documentation: env!("CARGO_PKG_HOMEPAGE").into(),
         license: env!("CARGO_PKG_LICENSE").into(),
-        docs: String::new(),
+        docs: include_str!("docs.md").into(),
+    }
+}
+
+/// The pose fields' summaries, in [`POSE_FIELDS`] order.
+const POSE_SUMMARIES: [&str; 6] = [
+    "Camera position on the world's x axis",
+    "Camera position on the world's y axis",
+    "Camera position on the world's z axis",
+    "Camera pitch, in degrees",
+    "Camera yaw, in degrees",
+    "Camera roll, in degrees",
+];
+
+fn method_summary(name: &str) -> &'static str {
+    match name {
+        "move_local" => "Moves along the camera's own axes",
+        "move_world" => "Moves along the world's axes",
+        "turn_local" => "Turns about the camera's own axes",
+        "turn_world" => "Turns about the world's axes",
+        "capture" => "Takes a photo",
+        "capture_delayed" => "Takes a photo after a delay",
+        "close" => "Closes the camera",
+        "fly_path" => "Flies the camera along a track",
+        "fly_to" => "Flies to a saved position over seconds",
+        "track" => "A saved track's steps, by name",
+        "position" => "A saved position's pose, by name",
+        "stop" => "Stops every play",
+        "add_key" => "Adds the camera's pose to the chosen track",
+        _ => "",
     }
 }

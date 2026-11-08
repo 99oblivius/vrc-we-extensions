@@ -13,7 +13,7 @@ Run Intiface Central and start its server. This extension connects to `ws://127.
 | Part | What |
 |---|---|
 | namespace | `@INTIFACE`: `connected`, `devices`, `level` |
-| methods | `vibrate(intensity, seconds, device?)`, `stop()`, both open to a contact who controls you |
+| methods | `vibrate(intensity, seconds, device to none)`, `stop()`, both open to a contact who controls you |
 | page | `intiface`: its state, its devices, the strongest allowed, stop, scan, reconnect |
 | status | a line in the status bar |
 | actions | Vibrate, Stop all devices |

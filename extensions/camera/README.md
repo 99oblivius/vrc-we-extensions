@@ -8,7 +8,7 @@ It is the large worked example: everything an extension can declare except secre
 
 | Part | What |
 |---|---|
-| namespace | `@CAMERA`: fields `pose`, `mode`, the settings sliders and toggles, the methods below, and one signal, `play_ended` |
+| namespace | `@CAMERA`: fields `x`, `y`, `z`, `pitch`, `yaw`, `roll`, `mode`, the settings sliders and toggles, the methods below, and one signal, `play_ended` |
 | OSC | reads and writes `/usercamera/` only |
 | page | `camera`: the pads, capture, mode, the settings sliders and toggles |
 | modal | the editor: a 3D view of the path, a timeline of keys, the track library |

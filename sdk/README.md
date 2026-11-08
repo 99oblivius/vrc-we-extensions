@@ -26,7 +26,7 @@ client                                   module (wasm32-unknown-unknown)
 | Field | What it says |
 |---|---|
 | `name`, `author`, `version` | identity: the repository plus the name is the extension, and the author is shown |
-| `namespace` | the Wex namespace it provides: fields (readable, some writable and shared), methods (callable from scripts and, if marked, from controllers), signals (what a rule can trigger on) |
+| `namespace` | the Wex namespace it provides: fields (readable, some writable and shared), methods (callable from scripts and, if marked, from controllers), signals (what a rule can trigger on). A field's or a method's `summary` is the one line the script editor's hover and the docs reference show |
 | `osc_read` / `osc_write` | the OSC address prefixes it receives and may send, never under `/avatar/` |
 | `pages`, `actions`, `conditions` | its right-panel page, the actions a mapping offers, the conditions a rule can hold to |
 | `secrets` | the keyring slots it may keep, by name |
@@ -49,9 +49,10 @@ Every count and size has a constant in this crate, and the client enforces it:
 
 | Constant | Value | Bounds |
 |---|---|---|
-| `BOUNDARY_VERSION` | 6 | the boundary this SDK speaks |
+| `BOUNDARY_VERSION` | 7 | the boundary this SDK speaks |
 | `TEXT_MAX` / `LIST_MAX` / `VALUES_MAX` | 4 KiB / 1024 / 16384 | a value, a list, one call's values |
 | `FIELDS_MAX` / `METHODS_MAX` / `SIGNALS_MAX` / `PARAMS_MAX` | 256 / 256 / 64 / 16 | a namespace |
+| `SUMMARY_MAX` | 50 characters | a field's or a method's summary |
 | `ICONS_MAX` / `ICON_MAX` | 64 / 8 KiB | packaged SVGs |
 | `OSC_PREFIXES_MAX` / `OSC_MESSAGE_MAX` | 16 / 4 KiB | OSC |
 | `NET_GRANTS_MAX` / `NET_BODY_MAX` / `NET_OPEN_MAX` | 16 / 1 MiB / 16 | network |

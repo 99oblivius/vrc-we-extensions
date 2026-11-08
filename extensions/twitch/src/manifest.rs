@@ -25,26 +25,82 @@ pub(crate) fn build() -> Manifest {
         namespace: Some(Namespace {
             name: "TWITCH".into(),
             fields: vec![
-                field("connected", Shape::Bool),
-                field("user", text(64)),
-                field("event", text(64)),
-                field("user_name", text(128)),
-                field("message", text(vrc_we_sdk::TEXT_MAX)),
-                field("reward", text(256)),
-                field("input", text(1_024)),
-                field("error", text(1_024)),
-                field("bits", number.clone()),
-                field("tier", number.clone()),
-                field("months", number.clone()),
-                field("viewers", number.clone()),
-                field("hype_level", number.clone()),
-                field("hype_progress", number.clone()),
-                field("hype_goal", number.clone()),
-                field("live", Shape::Bool),
-                field("poll_title", text(256)),
-                field("poll_status", text(32)),
-                field("poll_winner", text(256)),
-                field("poll_votes", number),
+                field(
+                    "connected",
+                    Shape::Bool,
+                    "True while signed in and hearing your channel",
+                ),
+                field("user", text(64), "Your own Twitch login, once you sign in"),
+                field("event", text(64), "Latest event's type, like channel.cheer"),
+                field(
+                    "user_name",
+                    text(128),
+                    "Display name of who caused the latest event",
+                ),
+                field(
+                    "message",
+                    text(vrc_we_sdk::TEXT_MAX),
+                    "Chat, cheer or resub text of the latest event",
+                ),
+                field(
+                    "reward",
+                    text(256),
+                    "Title of the reward the latest event redeemed",
+                ),
+                field("input", text(1_024), "What the viewer typed when redeeming"),
+                field(
+                    "error",
+                    text(1_024),
+                    "The latest Twitch problem, empty when none",
+                ),
+                field(
+                    "bits",
+                    number.clone(),
+                    "Bits cheered, or the hype train's total",
+                ),
+                field(
+                    "tier",
+                    number.clone(),
+                    "Tier of the latest sub: 1000, 2000 or 3000",
+                ),
+                field(
+                    "months",
+                    number.clone(),
+                    "Total months the latest resubscriber has",
+                ),
+                field("viewers", number.clone(), "Viewers the latest raid brought"),
+                field(
+                    "hype_level",
+                    number.clone(),
+                    "The hype train's current level",
+                ),
+                field(
+                    "hype_progress",
+                    number.clone(),
+                    "Points the hype train has toward its level",
+                ),
+                field(
+                    "hype_goal",
+                    number.clone(),
+                    "Points the hype train's level needs",
+                ),
+                field("live", Shape::Bool, "True while your stream is live"),
+                field("poll_title", text(256), "The latest poll's question"),
+                field(
+                    "poll_status",
+                    text(32),
+                    "The latest poll's state, like active",
+                ),
+                field(
+                    "poll_winner",
+                    text(256),
+                    "Choice with the most votes in the latest poll",
+                ),
+                field(
+                    "poll_votes",
+                    number,
+                    "Votes cast in the latest poll, all choices",
+                ),
             ],
             methods: vec![
                 Method {
@@ -59,6 +115,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Sends a message to the channel's chat".into(),
                 },
                 Method {
                     name: "clip".into(),
@@ -73,6 +130,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Clips the last 30 seconds of the stream".into(),
                 },
                 Method {
                     name: "marker".into(),
@@ -87,6 +145,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Marks this moment in the stream".into(),
                 },
                 Method {
                     name: "announce".into(),
@@ -100,6 +159,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Posts an announcement in chat".into(),
                 },
                 Method {
                     name: "title".into(),
@@ -113,6 +173,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Sets the stream title".into(),
                 },
                 Method {
                     name: "commercial".into(),
@@ -127,6 +188,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Runs a commercial, 60 seconds unless given".into(),
                 },
                 Method {
                     name: "poll".into(),
@@ -171,6 +233,7 @@ pub(crate) fn build() -> Manifest {
                     coroutine: false,
                     moves: Vec::new(),
                     contacts: false,
+                    summary: "Starts a poll of two to five choices".into(),
                 },
             ],
             // One signal per group: a mapping on `cheered` is a mapping
@@ -293,12 +356,13 @@ pub(crate) fn build() -> Manifest {
     }
 }
 
-fn field(name: &str, shape: Shape) -> Field {
+fn field(name: &str, shape: Shape, summary: &str) -> Field {
     Field {
         name: name.into(),
         shape,
         writable: false,
         shared: false,
+        summary: summary.into(),
     }
 }
 

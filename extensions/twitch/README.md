@@ -43,12 +43,12 @@ Conditions for the rule editor: `connected`, `bits`, `hype_level`, `viewers`, `t
 | Action | Scope | Notes |
 |---|---|---|
 | `chat(message)` | `user:write:chat` | 1 to 500 bytes |
-| `clip(title?)` | `clips:edit` | the last 30 seconds |
-| `marker(description?)` | `channel:manage:broadcast` | only while live |
+| `clip(title to none)` | `clips:edit` | the last 30 seconds |
+| `marker(description to none)` | `channel:manage:broadcast` | only while live |
 | `announce(message)` | `moderator:manage:announcements` | the channel's own chat |
 | `title(title)` | `channel:manage:broadcast` | |
-| `commercial(seconds?)` | `channel:edit:commercial` | 30 to 180 seconds, in 30 second steps |
-| `poll(title, first, second, third?, fourth?, fifth?, seconds?)` | `channel:manage:polls` | 2 to 5 choices, five minutes unless given, 15 to 1800 seconds |
+| `commercial(seconds to none)` | `channel:edit:commercial` | 30 to 180 seconds, in 30 second steps |
+| `poll(title, first, second, third to none, fourth to none, fifth to none, seconds to none)` | `channel:manage:polls` | 2 to 5 choices, five minutes unless given, 15 to 1800 seconds |
 
 It writes nothing into VRChat. The module has no OSC grant at all.
 

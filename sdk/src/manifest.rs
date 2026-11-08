@@ -100,6 +100,9 @@ pub const DESCRIPTION_MAX: usize = 1024;
 pub const DOCUMENTATION_MAX: usize = 2048;
 /// The longest Wex docs page a manifest may carry, in bytes.
 pub const DOCS_MAX: usize = 32 << 10;
+/// The longest summary a field or a method may carry, in characters: one line
+/// of the script editor's hover.
+pub const SUMMARY_MAX: usize = 50;
 
 /// An extension's own terms, or those of a service it uses: what the person
 /// accepts before installing it. The text travels inline when it is short, and
@@ -254,6 +257,11 @@ pub struct Field {
     /// leaves the client.
     #[serde(default)]
     pub shared: bool,
+    /// What it holds, in one line of at most [`SUMMARY_MAX`] characters: the
+    /// script editor's hover and the docs reference show it. Empty, the client
+    /// describes it from the declaration.
+    #[serde(default)]
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -275,6 +283,11 @@ pub struct Method {
     /// ([`Command::Fire`]). Any other method is this client's alone.
     #[serde(default)]
     pub contacts: bool,
+    /// What a call does, in one line of at most [`SUMMARY_MAX`] characters:
+    /// the script editor's hover and the docs reference show it. Empty, the
+    /// client describes it from the declaration.
+    #[serde(default)]
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

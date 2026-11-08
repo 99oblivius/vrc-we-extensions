@@ -690,7 +690,19 @@ mod tests {
 
     #[test]
     fn its_manifest_is_one_the_client_accepts() {
-        assert_eq!(Intiface::default().manifest().validate(), Ok(()));
+        let manifest = Intiface::default().manifest();
+        assert_eq!(manifest.validate(), Ok(()));
+        // The script editor's hover says what each one is for.
+        let ns = manifest.namespace.expect("a namespace");
+        let bare: Vec<&str> = ns
+            .fields
+            .iter()
+            .map(|f| (&f.name, &f.summary))
+            .chain(ns.methods.iter().map(|m| (&m.name, &m.summary)))
+            .filter(|(_, summary)| summary.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(bare.is_empty(), "no summary: {bare:?}");
     }
 
     /// A drive has a length, ended here: the protocol would let it run for ever.

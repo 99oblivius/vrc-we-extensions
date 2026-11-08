@@ -116,7 +116,7 @@ impl Camera {
         let sliders: Vec<Node> = SLIDERS
             .iter()
             .zip(self.sliders)
-            .map(|((field, _, label, min, max, _), v)| {
+            .map(|((field, _, label, min, max, ..), v)| {
                 let (min, v) = match *field == SMOOTHING_STRENGTH {
                     true if !self.smoothing() => (0.0, 0.0),
                     true => (0.0, f64::from(v)),
@@ -136,7 +136,7 @@ impl Camera {
         let toggles: Vec<Node> = TOGGLES
             .iter()
             .zip(self.toggles)
-            .map(|((field, _, label, _), v)| Node::Toggle {
+            .map(|((field, _, label, ..), v)| Node::Toggle {
                 id: (*field).to_owned(),
                 label: (*label).to_owned(),
                 value: Some(v),

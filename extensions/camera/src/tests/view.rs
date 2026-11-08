@@ -8,7 +8,19 @@ use vrc_we_sdk::UiEvent;
 
 #[test]
 fn the_manifest_validates() {
-    assert_eq!(Camera::default().manifest().validate(), Ok(()));
+    let manifest = Camera::default().manifest();
+    assert_eq!(manifest.validate(), Ok(()));
+    // The script editor's hover says what each one is for.
+    let ns = manifest.namespace.expect("a namespace");
+    let bare: Vec<&str> = ns
+        .fields
+        .iter()
+        .map(|f| (&f.name, &f.summary))
+        .chain(ns.methods.iter().map(|m| (&m.name, &m.summary)))
+        .filter(|(_, summary)| summary.is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(bare.is_empty(), "no summary: {bare:?}");
 }
 
 #[test]

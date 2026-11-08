@@ -16,6 +16,8 @@ pub enum ManifestError {
     BadShape(String),
     #[error("its {0} is too long or unreadable, or its address isn't https")]
     BadDetail(&'static str),
+    #[error("the summary of \"{0}\" is longer than {SUMMARY_MAX} characters or unreadable")]
+    BadSummary(String),
     #[error("{method} declares a required parameter \"{param}\" after an optional one")]
     RequiredAfterOptional { method: String, param: String },
     #[error("{method} moves \"{field}\", which isn't a writable field")]
@@ -156,6 +158,11 @@ pub fn is_label(name: &str) -> bool {
 /// Text people read: 1 to `max` bytes, no control characters, not blank.
 pub(crate) fn is_text_label(text: &str, max: usize) -> bool {
     text.len() <= max && !text.trim().is_empty() && !text.chars().any(char::is_control)
+}
+
+/// A summary: one readable line of at most [`SUMMARY_MAX`] characters.
+fn is_summary(text: &str) -> bool {
+    text.chars().count() <= SUMMARY_MAX && is_text_label(text, text.len())
 }
 
 /// The longest label a list item takes, in bytes.
@@ -401,6 +408,16 @@ impl Namespace {
                 return Err(ManifestError::Duplicate(name.clone()));
             }
             seen.push(name);
+        }
+        let summaries = self
+            .fields
+            .iter()
+            .map(|f| (&f.name, &f.summary))
+            .chain(self.methods.iter().map(|m| (&m.name, &m.summary)));
+        for (name, summary) in summaries {
+            if !summary.is_empty() && !is_summary(summary) {
+                return Err(ManifestError::BadSummary(name.clone()));
+            }
         }
         for f in &self.fields {
             check_shape(&f.name, &f.shape)?;
