@@ -151,6 +151,14 @@ impl Extension for Template {
                 self.count = value.and_then(|v| v.parse().ok()).unwrap_or(0.0);
                 self.publish()
             }
+            Event::Write { field, value } if field == "armed" => {
+                if let Value::Bool(on) = value {
+                    self.armed = on;
+                    self.publish()
+                } else {
+                    Vec::new()
+                }
+            }
             Event::Call {
                 id, method, args, ..
             } if method == "add" => {
@@ -241,6 +249,20 @@ mod tests {
                 id: "armed".into(),
                 value: true,
             },
+        });
+        assert!(t.armed);
+        assert!(out.contains(&Command::Field {
+            name: "armed".into(),
+            value: Value::Bool(true)
+        }));
+    }
+
+    #[test]
+    fn a_scripts_write_sets_the_same_field() {
+        let mut t = Template::default();
+        let out = t.handle(Event::Write {
+            field: "armed".into(),
+            value: Value::Bool(true),
         });
         assert!(t.armed);
         assert!(out.contains(&Command::Field {
