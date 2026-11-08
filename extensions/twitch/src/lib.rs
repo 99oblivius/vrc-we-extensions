@@ -2504,6 +2504,43 @@ mod tests {
         assert!(echo(&mut t, "m3", "thanks"), "the person typed it themself");
     }
 
+    /// Two messages with the same text are two sends: a signal counts sends,
+    /// not values, so the second one signals too. A field holds a value, so
+    /// an unchanged one publishes nothing and cannot tell them apart. An
+    /// EventSub redelivery of one message carries the same envelope id and is
+    /// the one thing dropped.
+    #[test]
+    fn two_identical_chat_messages_each_signal() {
+        let (mut t, socket, _) = welcomed(&["chatted"]);
+        let message = |envelope: &str| Event::Received {
+            id: socket,
+            data: Data::Text(format!(
+                r#"{{"metadata":{{"message_type":"notification","message_id":"{envelope}","subscription_type":"channel.chat.message"}},"payload":{{"event":{{"message_id":"{envelope}","chatter_user_id":"42","chatter_user_name":"a","message":{{"text":"!hug"}}}}}}}}"#
+            )),
+        };
+        let first = t.handle(message("m1"));
+        let second = t.handle(message("m2"));
+        let redelivered = t.handle(message("m2"));
+        let signals = |out: &[Command]| {
+            out.iter()
+                .filter(|c| matches!(c, Command::Signal { name, .. } if name == "chatted"))
+                .count()
+        };
+        assert_eq!(signals(&first), 1, "the first message signals");
+        assert_eq!(signals(&second), 1, "the same text again signals again");
+        assert_eq!(
+            signals(&redelivered),
+            0,
+            "a redelivery of one message is dropped"
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|c| matches!(c, Command::Field { name, .. } if name == "message")),
+            "an unchanged field publishes nothing, so a condition on it never moves"
+        );
+    }
+
     /// A press before Twitch answers doesn't ask twice, and an answer to a
     /// cancelled sign-in stores nothing.
     #[test]
