@@ -1588,8 +1588,16 @@ impl Twitch {
                     return out;
                 }
                 let seconds = match args.get(6) {
-                    Some(Value::Number(n)) => {
-                        n.clamp(POLL_MIN_SECONDS as f64, POLL_MAX_SECONDS as f64) as u64
+                    Some(Value::Number(n))
+                        if n.is_finite()
+                            && *n >= POLL_MIN_SECONDS as f64
+                            && *n <= POLL_MAX_SECONDS as f64 =>
+                    {
+                        *n as u64
+                    }
+                    Some(Value::Number(_)) => {
+                        self.refuse(&mut out, id, "A poll runs 15 to 1800 seconds.");
+                        return out;
                     }
                     _ => POLL_SECONDS,
                 };
@@ -1788,6 +1796,35 @@ mod tests {
     fn field(out: &[Command], name: &str) -> Option<Value> {
         out.iter().rev().find_map(|c| match c {
             Command::Field { name: n, value } if n == name => Some(value.clone()),
+            _ => None,
+        })
+    }
+
+    /// Whether `out` answers call `id` with `yes`.
+    fn replied(out: &[Command], id: u64, yes: bool) -> bool {
+        out.iter().any(|c| {
+            matches!(c, Command::Reply { id: i, value: Value::Bool(b) } if *i == id && *b == yes)
+        })
+    }
+
+    fn call(t: &mut Twitch, id: u64, method: &str, args: Vec<Value>) -> Vec<Command> {
+        t.handle(Event::Call {
+            id,
+            method: method.into(),
+            args,
+            from: None,
+        })
+    }
+
+    /// The JSON body of the first `method` request to `url`.
+    fn helix<'a>(out: &'a [Command], method: &str, url: &str) -> Option<&'a str> {
+        out.iter().find_map(|c| match c {
+            Command::Http {
+                method: m,
+                url: u,
+                body: Some(Data::Text(b)),
+                ..
+            } if m == method && u.starts_with(url) => Some(b.as_str()),
             _ => None,
         })
     }
@@ -2762,6 +2799,113 @@ mod tests {
         let marker = marker.expect("a marker call");
         assert!(marker.contains("\"user_id\":\"1337\""), "{marker}");
         assert!(marker.contains("redeem"), "{marker}");
+    }
+
+    #[test]
+    fn every_remaining_action_is_the_helix_call_twitch_documents() {
+        let mut t = signed_in(&[]);
+
+        let out = call(&mut t, 10, "announce", vec![Value::Text("hello".into())]);
+        let body = helix(&out, "POST", protocol::ANNOUNCE_URL).expect("announce");
+        assert!(body.contains("\"message\":\"hello\""), "{body}");
+        assert!(replied(&out, 10, true));
+
+        let out = call(&mut t, 11, "title", vec![Value::Text("A title".into())]);
+        let body = helix(&out, "PATCH", protocol::CHANNELS_URL).expect("title");
+        assert!(body.contains("\"title\":\"A title\""), "{body}");
+        assert!(replied(&out, 11, true));
+
+        let out = call(&mut t, 12, "commercial", vec![Value::Number(90.0)]);
+        let body = helix(&out, "POST", protocol::COMMERCIAL_URL).expect("commercial");
+        assert!(body.contains("\"length\":90"), "{body}");
+        assert!(replied(&out, 12, true));
+
+        let out = call(
+            &mut t,
+            13,
+            "poll",
+            vec![
+                Value::Text("Shoes?".into()),
+                Value::Text("Yes".into()),
+                Value::Text("No".into()),
+            ],
+        );
+        let body = helix(&out, "POST", protocol::POLLS_URL).expect("poll");
+        assert!(body.contains("\"title\":\"Shoes?\""), "{body}");
+        assert!(
+            body.contains("\"duration\":300"),
+            "five minutes unless asked: {body}"
+        );
+        assert!(replied(&out, 13, true));
+    }
+
+    #[test]
+    fn actions_refuse_what_twitch_would() {
+        let mut t = Twitch::default();
+
+        let out = call(&mut t, 20, "announce", vec![Value::Text(String::new())]);
+        assert!(replied(&out, 20, false));
+        assert!(t.error.as_deref().unwrap_or("").contains("1 to 500"));
+
+        let out = call(&mut t, 21, "title", vec![Value::Text("x".repeat(141))]);
+        assert!(replied(&out, 21, false));
+        assert!(t.error.as_deref().unwrap_or("").contains("1 to 140"));
+
+        let out = call(&mut t, 22, "commercial", vec![Value::Number(45.0)]);
+        assert!(replied(&out, 22, false));
+        assert!(t.error.as_deref().unwrap_or("").contains("30 to 180"));
+
+        let out = call(
+            &mut t,
+            23,
+            "poll",
+            vec![Value::Text("Shoes?".into()), Value::Text("Yes".into())],
+        );
+        assert!(replied(&out, 23, false));
+        assert!(t.error.as_deref().unwrap_or("").contains("two choices"));
+
+        let out = call(
+            &mut t,
+            24,
+            "poll",
+            vec![
+                Value::Text("Shoes?".into()),
+                Value::Text("A".into()),
+                Value::Text("B".into()),
+                Value::Text("C".into()),
+                Value::Text("D".into()),
+                Value::Text("E".into()),
+                Value::Number(5.0),
+            ],
+        );
+        assert!(replied(&out, 24, false));
+        assert!(
+            t.error.as_deref().unwrap_or("").contains("15 to 1800"),
+            "a short poll is refused, not clamped: {:?}",
+            t.error
+        );
+    }
+
+    #[test]
+    fn a_poll_uses_the_seconds_it_was_given() {
+        let mut t = signed_in(&[]);
+        let out = call(
+            &mut t,
+            25,
+            "poll",
+            vec![
+                Value::Text("Shoes?".into()),
+                Value::Text("A".into()),
+                Value::Text("B".into()),
+                Value::Text("C".into()),
+                Value::Text("D".into()),
+                Value::Text("E".into()),
+                Value::Number(900.0),
+            ],
+        );
+        let body = helix(&out, "POST", protocol::POLLS_URL).expect("poll");
+        assert!(body.contains("\"duration\":900"), "{body}");
+        assert!(replied(&out, 25, true));
     }
 
     #[test]

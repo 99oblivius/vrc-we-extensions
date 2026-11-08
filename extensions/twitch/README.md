@@ -48,7 +48,7 @@ Conditions for the rule editor: `connected`, `bits`, `hype_level`, `viewers`, `t
 | `announce(message)` | `moderator:manage:announcements` | the channel's own chat |
 | `title(title)` | `channel:manage:broadcast` | |
 | `commercial(seconds?)` | `channel:edit:commercial` | 30 to 180 seconds, in 30 second steps |
-| `poll(title, first, second, third?, fourth?, fifth?, seconds?)` | `channel:manage:polls` | 2 to 5 choices, five minutes unless given |
+| `poll(title, first, second, third?, fourth?, fifth?, seconds?)` | `channel:manage:polls` | 2 to 5 choices, five minutes unless given, 15 to 1800 seconds |
 
 It writes nothing into VRChat. The module has no OSC grant at all.
 
