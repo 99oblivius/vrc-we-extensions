@@ -7,18 +7,6 @@ Each event is a signal. An `on` runs its block once per event, the same
 message twice included, and inside the block the fields describe that
 event.
 
-```
-on @TWITCH.chatted is "!hug" {
-    run @TWITCH.chat("{@TWITCH.user_name} gets a hug")
-}
-on @TWITCH.cheered >= 100 {
-    set @Sparkle to true
-}
-on @TWITCH.followed {
-    run @TWITCH.chat("Welcome, {@TWITCH.user_name}!")
-}
-```
-
 What each signal carries, what its `is` or `>=` compares:
 
 - `chatted`: a chat message, its first 64 bytes. The whole message is
@@ -36,6 +24,94 @@ What each signal carries, what its `is` or `>=` compares:
 
 A message this extension sends to chat never comes back as `chatted`, so a
 reply can't answer itself. What you type yourself does.
+
+## Reading an event's own values
+
+A field holds the latest event's value, whatever kind it was. Inside an
+`on` block those are its own event's values, from the block's first line
+until something newer lands. Take the ones you need into names at the top
+of the block, and they stay yours:
+
+```
+on @TWITCH.subscribed {
+    set who to @TWITCH.user_name
+    set months to @TWITCH.months
+    run @TWITCH.chat("Thanks {who}, {months} months in!")
+}
+```
+
+`cheered` compares its bits as a number, and `@TWITCH.bits` holds that same
+number. A hundred bits is worth a shout:
+
+```
+on @TWITCH.cheered >= 100 {
+    set who to @TWITCH.user_name
+    set bits to @TWITCH.bits
+    run @TWITCH.chat("{who} cheered {bits} bits!")
+}
+```
+
+A `wait` or a `launch` gives other events time to land, and a field read
+after it holds whatever landed last. The bound names keep their values, so
+bind first: without the first line, `{who}` can be someone else by the time
+the chat goes out.
+
+## A command in chat
+
+`chatted` carries the message's first 64 bytes, so a command is matched as
+written, from its first character to its last, upper and lower case kept:
+
+```
+on @TWITCH.chatted is "!hug" {
+    set who to @TWITCH.user_name
+    run @TWITCH.chat("{who} gets a hug")
+}
+```
+
+The whole message has to be the command. `!hug @someone` is a different
+text, and so is `!HUG`, so neither runs this block.
+
+## A welcome that takes its time
+
+The values a recipe needs travel in its arguments. Bind them, launch the
+recipe, and it works from its own copy however long it waits:
+
+```
+recipe welcome(who, months) {
+    if months >= 12 {
+        run @TWITCH.announce("Welcome back, {who}!")
+    }
+    wait 2s
+    run @TWITCH.chat("Say hi to {who}")
+}
+
+on @TWITCH.subscribed {
+    set who to @TWITCH.user_name
+    set months to @TWITCH.months
+    launch welcome(who, months)
+}
+```
+
+## A block that keeps listening
+
+An `on` inside an `on` starts when the outer block reaches it, and stops
+with that block. Each one reads the event it is about: the outer bound
+`who` stays the subscriber, while the inner block binds its own cheerer.
+A second subscriber during that minute restarts the outer block, whose
+`who` is the new one.
+
+```
+on @TWITCH.subscribed {
+    set who to @TWITCH.user_name
+    run @TWITCH.chat("Welcome {who}! First cheer gets a shout.")
+    on @TWITCH.cheered >= 500 {
+        set fan to @TWITCH.user_name
+        set bits to @TWITCH.bits
+        run @TWITCH.chat("{fan} cheered {bits} bits for {who}")
+    }
+    wait 60s
+}
+```
 
 ## Fields
 
@@ -58,8 +134,8 @@ on @TWITCH.subscribed {
 }
 ```
 
-Read a field inside the block of the event it describes: the next event
-replaces it.
+Read a field inside the block of the event it describes, or into a name of
+your own first: the next event replaces it.
 
 ## Acting on the channel
 
@@ -73,10 +149,10 @@ extension: that call reads none.
 - `clip()`, `clip(title)`: a clip of the last 30 seconds.
 - `marker()`, `marker(description)`: a stream marker.
 - `title(title)`: the stream title, up to 140 bytes.
-- `commercial()`, `commercial(seconds)`: a commercial, 60 seconds unless
-  you say.
-- `poll(title, first, second)`: a poll, with up to three more choices and
-  then its seconds.
+- `commercial()`, `commercial(seconds)`: a commercial, 60 seconds unless you
+  say, 30 to 180 in 30 second steps.
+- `poll(title, first, second)`: a poll, two to five choices, then its
+  seconds: 5 minutes unless you say, 30 at most.
 
 ```
 on @TWITCH.chatted is "!clip" {
