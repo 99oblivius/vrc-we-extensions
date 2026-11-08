@@ -101,21 +101,14 @@ impl Group {
     fn payload_shape(self, signal: &str) -> Shape {
         match (self, signal) {
             (Self::Redeems, _) => Shape::Text { max: 256 },
-            (Self::Chat, _) => Shape::Text { max: 64 },
+            (Self::Chat, _) => Shape::Text {
+                max: vrc_we_sdk::TEXT_MAX,
+            },
             (Self::Poll, "polled" | "poll_ended") => Shape::Text { max: 256 },
             (Self::Follow, _) | (Self::Live, _) => Shape::None,
             _ => Shape::Number(None),
         }
     }
-}
-
-/// `text` cut to at most `max` bytes, on a character's edge.
-fn at_most(text: &str, max: usize) -> &str {
-    let mut end = text.len().min(max);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 /// The signal one event is sent under, and what it carries: the value a
@@ -126,10 +119,7 @@ fn signal_of(fact: &protocol::Fact) -> Option<(&'static str, Value)> {
         "channel.channel_points_custom_reward_redemption.add" => {
             ("redeemed", Value::Text(fact.reward.clone()))
         }
-        "channel.chat.message" => (
-            "chatted",
-            Value::Text(at_most(&fact.message, 64).to_owned()),
-        ),
+        "channel.chat.message" => ("chatted", Value::Text(fact.message.clone())),
         "channel.subscribe" | "channel.subscription.message" => {
             ("subscribed", Value::Number(fact.tier))
         }
@@ -2448,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_signal_stays_within_its_bytes_on_a_character() {
+    fn a_chat_signal_carries_the_whole_message() {
         let (mut t, socket, _) = welcomed(&["chatted"]);
         let message = "é".repeat(40);
         let out = t.handle(Event::Received {
@@ -2464,9 +2454,24 @@ mod tests {
             } => Some(text.clone()),
             _ => None,
         });
-        let carried = carried.expect("a signal");
-        assert!(carried.len() <= 64, "{}", carried.len());
-        assert_eq!(carried, "é".repeat(32));
+        assert_eq!(
+            carried.as_deref(),
+            Some(message.as_str()),
+            "the whole message, past the old 64-byte cut"
+        );
+        assert_eq!(
+            t.manifest()
+                .namespace
+                .expect("a namespace")
+                .signals
+                .into_iter()
+                .find(|s| s.name == "chatted")
+                .map(|s| s.payload),
+            Some(Shape::Text {
+                max: vrc_we_sdk::TEXT_MAX
+            }),
+            "and the manifest says the payload holds any text"
+        );
     }
 
     /// A chat message it sent comes back without a signal, whether its echo

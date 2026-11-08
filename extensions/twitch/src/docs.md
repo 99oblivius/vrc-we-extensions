@@ -9,8 +9,8 @@ event.
 
 What each signal carries, what its `is` or `>=` compares:
 
-- `chatted`: a chat message, its first 64 bytes. The whole message is
-  `@TWITCH.message`.
+- `chatted`: a chat message, its text. `@TWITCH.message` is the latest
+  text any event carried, empty when it carried none.
 - `redeemed`: a channel point redemption, the reward's title. What the
   viewer typed is `@TWITCH.input`.
 - `subscribed`: a subscription, its tier: 1000, 2000 or 3000.
@@ -58,8 +58,8 @@ the chat goes out.
 
 ## A command in chat
 
-`chatted` carries the message's first 64 bytes, so a command is matched as
-written, from its first character to its last, upper and lower case kept:
+`chatted` carries the whole message, so a command is matched as written,
+from its first character to its last, upper and lower case kept:
 
 ```
 on @TWITCH.chatted is "!hug" {
@@ -70,6 +70,20 @@ on @TWITCH.chatted is "!hug" {
 
 The whole message has to be the command. `!hug @someone` is a different
 text, and so is `!HUG`, so neither runs this block.
+
+## A redemption
+
+`redeemed` carries the reward's title. What the viewer typed is `input`:
+
+```
+on @TWITCH.redeemed is "Dance" {
+    set who to @TWITCH.user_name
+    set what to @TWITCH.input
+    if what is not "" {
+        run @TWITCH.chat("{who} redeemed Dance: {what}")
+    }
+}
+```
 
 ## A welcome that takes its time
 
@@ -113,6 +127,48 @@ on @TWITCH.subscribed {
 }
 ```
 
+## Other events
+
+`raided` compares the viewers, `poll_ended` carries the winner, and
+`went_live` carries nothing:
+
+```
+on @TWITCH.raided >= 10 {
+    run @TWITCH.chat("{@TWITCH.user_name} raided with {@TWITCH.viewers}!")
+}
+on @TWITCH.poll_ended {
+    run @TWITCH.announce("The poll winner is {@TWITCH.poll_winner}")
+}
+on @TWITCH.went_live {
+    run @TWITCH.title("Live now")
+}
+```
+
+## Small events
+
+`gifted` carries the number of subs, `hype` the level, `polled` the
+title, and `followed` and `went_offline` carry nothing:
+
+```
+on @TWITCH.gifted >= 5 {
+    set n to @TWITCH.gifted
+    run @TWITCH.chat("{@TWITCH.user_name} gifted {n} subs!")
+}
+on @TWITCH.hype >= 3 {
+    set level to @TWITCH.hype
+    set @hype to level
+}
+on @TWITCH.polled {
+    set @poll to @TWITCH.poll_title
+}
+on @TWITCH.followed {
+    set @wave to true
+}
+on @TWITCH.went_offline {
+    run @TWITCH.title("Offline")
+}
+```
+
 ## Fields
 
 The fields hold the latest event's details: `user_name` is who did it,
@@ -127,6 +183,12 @@ while the stream is live, `user` is the account signed in, and `error` the
 latest thing that went wrong.
 
 ```
+if @TWITCH.connected is true and @TWITCH.live is true {
+    set @status to "Live as {@TWITCH.user}"
+}
+```
+
+```
 on @TWITCH.subscribed {
     if @TWITCH.months >= 12 {
         run @TWITCH.chat("A year, {@TWITCH.user_name}!")
@@ -136,6 +198,11 @@ on @TWITCH.subscribed {
 
 Read a field inside the block of the event it describes, or into a name of
 your own first: the next event replaces it.
+
+A field holds the latest value. An event is a separate send: two chat
+messages with the same text send two `chatted` signals and one `message`
+update. `message` holds what the latest event said, empty when it said
+nothing.
 
 ## Acting on the channel
 
@@ -152,11 +219,25 @@ extension: that call reads none.
 - `commercial()`, `commercial(seconds)`: a commercial, 60 seconds unless you
   say, 30 to 180 in 30 second steps.
 - `poll(title, first, second)`: a poll, two to five choices, then its
-  seconds: 5 minutes unless you say, 30 at most.
+  seconds: 5 minutes unless you say, 15 to 1800.
 
 ```
 on @TWITCH.chatted is "!clip" {
     run @TWITCH.clip("{@TWITCH.user_name} asked")
+}
+run @TWITCH.marker("chapter two")
+run @TWITCH.commercial(60)
+run @TWITCH.poll("Shoes?", "Yes", "No")
+```
+
+A call that fails says why in `@TWITCH.error`, and a later success clears
+it:
+
+```
+on @TWITCH.error changes {
+    if @TWITCH.error is not "" {
+        run @TWITCH.chat("Twitch said no: {@TWITCH.error}")
+    }
 }
 ```
 

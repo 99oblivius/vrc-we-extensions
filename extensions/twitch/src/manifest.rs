@@ -29,7 +29,7 @@ pub(crate) fn build() -> Manifest {
                 field("user", text(64)),
                 field("event", text(64)),
                 field("user_name", text(128)),
-                field("message", text(1_024)),
+                field("message", text(vrc_we_sdk::TEXT_MAX)),
                 field("reward", text(256)),
                 field("input", text(1_024)),
                 field("error", text(1_024)),
