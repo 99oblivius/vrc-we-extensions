@@ -2,7 +2,7 @@ use crate::library::clean_name;
 use crate::motion::{step_of, with_curve, Curve};
 use crate::*;
 
-use vrc_we_sdk::{Item, UiEvent};
+use vrc_we_sdk::{Drawn, Item, Plot, Scene, UiEvent};
 
 pub(super) fn pose_in(pose: [f32; 6]) -> Event {
     Event::Osc(OscMessage {
@@ -176,29 +176,43 @@ pub(super) fn number_in(page: &str, id: &str, value: f64) -> Event {
     )
 }
 
+/// What `node` shows, in order: each part's id, and its value or words.
 pub(super) fn texts(node: &Node, into: &mut Vec<String>) {
-    match node {
-        Node::Column(items) | Node::Row(items) => items.iter().for_each(|n| texts(n, into)),
-        Node::Heading(t) | Node::Text(t) => into.push(t.clone()),
+    use vrc_we_sdk::Act;
+    node.each(&mut |n| match n {
+        Node::Text(t) => into.push(t.text.clone()),
         Node::Status(status) => into.push(status.label.clone()),
-        Node::Link { label, url } => into.push(format!("{label} -> {url}")),
-        Node::Number { id, value, .. } | Node::Slider { id, value, .. } => {
-            into.push(format!("{id}={value:?}"))
+        Node::Number(n) => into.push(format!("{}={:?}", n.id, n.value)),
+        Node::Slider(s) => into.push(format!("{}={:?}", s.id, s.value)),
+        Node::Input(i) => into.push(format!("{}={}", i.id, i.value)),
+        Node::Toggle(t) => into.push(format!("{}={:?}", t.id, t.value)),
+        Node::Button(b) => into.push(match &b.act {
+            Act::Copy(text) => format!("copy {text}"),
+            Act::Choose(_) => format!("{}: {}", b.id, b.label),
+            _ => b.id.clone(),
+        }),
+        Node::Choice(c) => into.push(c.id.clone()),
+        Node::Plot(p) => into.push(p.id.clone()),
+        Node::Scene(s) => {
+            let points: usize = s.paths.iter().map(|p| p.points.len()).sum();
+            into.push(format!("path of {points}"))
         }
-        Node::Button { id, .. } | Node::Choice { id, .. } => into.push(id.clone()),
-        Node::Scene3d { path, .. } => into.push(format!("path of {}", path.len())),
-        Node::TextInput { id, value, .. } => into.push(format!("{id}={value}")),
-        Node::Toggle { id, value, .. } => into.push(format!("{id}={value:?}")),
-        Node::List { id, items, .. } => into.push(format!("{id}: {}", items.join(" | "))),
-        Node::Copy { text, .. } => into.push(format!("copy {text}")),
-        Node::Split { main, side } => [main, side].into_iter().for_each(|n| texts(n, into)),
-        Node::IconButton { id, .. }
-        | Node::HoldButton { id, .. }
-        | Node::Buttons { id, .. }
-        | Node::Timeline { id, .. } => into.push(id.clone()),
-        Node::Icon { icon } => into.push(icon.clone()),
-        Node::Divider => {}
-    }
+        _ => {}
+    });
+}
+
+/// The first of `node`'s parts that `pick` takes.
+pub(super) fn part<'a, T>(
+    node: &'a Node,
+    mut pick: impl FnMut(&'a Node) -> Option<T>,
+) -> Option<T> {
+    let mut found = None;
+    node.each(&mut |n| {
+        if found.is_none() {
+            found = pick(n);
+        }
+    });
+    found
 }
 
 /// What the last published view of the page (or of the editor) shows.
@@ -214,25 +228,26 @@ pub(super) fn shown(cam: &Camera, editor: bool) -> Vec<String> {
 
 /// The 3D view's key points.
 pub(super) fn keys_of(node: &Node) -> Option<Vec<[f32; 3]>> {
-    match node {
-        Node::Scene3d { path, keys, .. } => Some(keys.iter().map(|k| path[*k]).collect()),
-        Node::Column(items) | Node::Row(items) => items.iter().find_map(keys_of),
-        Node::Split { main, side } => keys_of(main).or_else(|| keys_of(side)),
+    scene_of(node).map(|s| s.points.iter().map(|p| p.at).collect())
+}
+
+/// The timeline, and where its playhead is.
+pub(super) fn timeline_of(node: &Node) -> Option<&Plot> {
+    part(node, |n| match n {
+        Node::Plot(p) => Some(p),
         _ => None,
-    }
+    })
 }
 
 pub(super) fn playhead_of(node: &Node) -> Option<Option<f32>> {
-    match node {
-        Node::Timeline { playhead, .. } => Some(*playhead),
-        Node::Column(items) | Node::Row(items) => items.iter().find_map(playhead_of),
-        Node::Split { main, side } => playhead_of(main).or_else(|| playhead_of(side)),
+    timeline_of(node)?.items.iter().find_map(|i| match i {
+        Drawn::Line(l) => Some(l.at),
         _ => None,
-    }
+    })
 }
 
 pub(super) const FORWARD: Step = [
-    0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 ];
 
 /// A camera at the origin with a saved track `name` of `steps`.
@@ -301,28 +316,17 @@ pub(super) fn curved(s: [f32; 7], curve: Curve) -> Step {
     with_curve(lin(s), curve)
 }
 
-/// The editor's scene and timeline as last published.
-pub(super) fn editor_nodes(cam: &Camera) -> (Option<Node>, Option<vrc_we_sdk::Lane>) {
-    fn walk(n: &Node, scene: &mut Option<Node>, lane: &mut Option<vrc_we_sdk::Lane>) {
-        match n {
-            Node::Column(items) | Node::Row(items) => {
-                items.iter().for_each(|i| walk(i, scene, lane))
-            }
-            Node::Split { main, side } => {
-                [main, side].into_iter().for_each(|i| walk(i, scene, lane))
-            }
-            Node::Scene3d { overlay, .. } => *scene = overlay.as_deref().cloned(),
-            Node::Timeline { lane: l, .. } => *lane = l.clone(),
+/// The sliders of the editor as last published whose ids `named` has.
+pub(super) fn sliders_shown(cam: &Camera, named: &[&str]) -> Vec<String> {
+    let mut ids = Vec::new();
+    cam.shown_editor
+        .as_ref()
+        .expect("an editor")
+        .each(&mut |n| match n {
+            Node::Slider(s) if named.contains(&s.id.as_str()) => ids.push(s.id.clone()),
             _ => {}
-        }
-    }
-    let (mut scene, mut lane) = (None, None);
-    walk(
-        cam.shown_editor.as_ref().expect("an editor"),
-        &mut scene,
-        &mut lane,
-    );
-    (scene, lane)
+        });
+    ids
 }
 
 /// A track of `keys` keys along +z, 2 m and 1 s apart, open, in the editor.
@@ -339,13 +343,11 @@ pub(super) fn straight_track(keys: usize) -> Camera {
 }
 
 /// The editor's 3D view as last built.
-pub(super) fn scene_of(node: &Node) -> Option<&Node> {
-    match node {
-        Node::Scene3d { .. } => Some(node),
-        Node::Column(items) | Node::Row(items) => items.iter().find_map(scene_of),
-        Node::Split { main, side } => scene_of(main).or_else(|| scene_of(side)),
+pub(super) fn scene_of(node: &Node) -> Option<&Scene> {
+    part(node, |n| match n {
+        Node::Scene(s) => Some(s),
         _ => None,
-    }
+    })
 }
 
 pub(super) fn write(field: &str, value: f64) -> Event {
@@ -379,4 +381,18 @@ pub(super) fn with_send(cam: &mut Camera, event: Event) -> Vec<Command> {
     let mut out = cam.handle(event);
     out.extend(cam.handle(timer(SEND_SETTINGS)));
     out
+}
+
+/// Key `index` of the timeline dragged to `at` seconds and `height`.
+pub(super) fn drag_key(index: usize, at: f64, height: f64, done: bool) -> Event {
+    ui(
+        EDITOR,
+        UiEvent::Dragged {
+            id: "timeline".into(),
+            index,
+            at,
+            value: height,
+            done,
+        },
+    )
 }

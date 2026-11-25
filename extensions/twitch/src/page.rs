@@ -2,12 +2,12 @@
 //! in, whether Twitch is delivering what is wanted, the last event and the
 //! last error. It reads a snapshot of the module, never the machine itself.
 
-use vrc_we_sdk::{Node, Status, Tone};
+use vrc_we_sdk::{Button, Flow, Node, Status, Tone};
 
 use crate::protocol::{Fact, Group};
 use crate::Login;
 
-/// The icon the module packages: Twitch's logo.
+/// The packaged icon: Twitch's logo.
 pub(crate) const LOGO: &str = "twitch";
 
 /// What the socket and its subscriptions come to.
@@ -98,55 +98,53 @@ pub(crate) fn bar(s: &Snapshot) -> Status {
 /// The page as `s` describes it.
 pub(crate) fn view(s: &Snapshot) -> Node {
     let (tone, label) = login_line(s);
-    let mut rows = vec![
-        Node::Heading("Twitch".into()),
-        Node::Status(Status {
-            tone,
-            label,
-            icon: Some(LOGO.into()),
-            page: None,
-        }),
-    ];
+    let mut rows: Vec<Node> = vec![Status {
+        tone,
+        label,
+        icon: None,
+        page: None,
+    }
+    .into()];
     if s.login == Login::In {
         let (tone, label) = events_line(s.events);
-        rows.push(Node::Status(Status {
-            tone,
-            label: label.into(),
-            icon: None,
-            page: None,
-        }));
-        rows.extend(detail(s).into_iter().map(Node::Text));
+        rows.push(
+            Status {
+                tone,
+                label: label.into(),
+                icon: None,
+                page: None,
+            }
+            .into(),
+        );
+        rows.extend(detail(s).into_iter().map(Node::from));
     }
     if let Some(link) = s.device {
-        rows.push(Node::Text(
-            "Approve this client on Twitch; the page is already waiting. Nothing is typed here."
-                .into(),
-        ));
-        rows.push(Node::Link {
-            label: "Authorize on Twitch".into(),
-            url: link.to_owned(),
-        });
-        rows.push(button("cancel", "Cancel"));
+        rows.push("Approve this client in your browser. Nothing is typed here.".into());
+        rows.push(Button::link("Open the approval page", link).into());
+        rows.push(Button::new("cancel", "Cancel").into());
     } else {
         rows.extend(actions(s));
     }
     if let Some(fact) = s.last {
         rows.push(Node::Divider);
-        rows.push(Node::Text(format!(
-            "Last: {} by {}{}",
-            fact.kind,
-            fact.user,
-            if fact.message.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", fact.message)
-            }
-        )));
+        rows.push(
+            format!(
+                "Last: {} by {}{}",
+                fact.kind,
+                fact.user,
+                if fact.message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", fact.message)
+                }
+            )
+            .into(),
+        );
     }
     if let Some(error) = s.error {
-        rows.push(Node::Text(format!("Last error: {error}")));
+        rows.push(format!("Last error: {error}").into());
     }
-    Node::Column(rows)
+    Flow::col(rows).into()
 }
 
 /// What the events line comes down to: only the cases that say something the
@@ -154,10 +152,9 @@ pub(crate) fn view(s: &Snapshot) -> Node {
 fn detail(s: &Snapshot) -> Vec<String> {
     let mut rows = Vec::new();
     match s.events {
-        Events::Idle => rows.push(
-            "A mapping or script that reads a Twitch field or handles one of its signals subscribes to it."
-                .to_owned(),
-        ),
+        Events::Idle => {
+            rows.push("Events are subscribed to when a mapping or a script uses them.".to_owned())
+        }
         Events::Connecting if s.retry_armed => rows.push("Trying again shortly.".to_owned()),
         Events::Connecting => {}
         Events::Waiting | Events::Connected => {
@@ -170,7 +167,7 @@ fn detail(s: &Snapshot) -> Vec<String> {
         }
     }
     if s.busy {
-        rows.push("Twitch is busy, trying again.".to_owned());
+        rows.push("Busy, trying again.".to_owned());
     }
     if !s.missing.is_empty() {
         rows.push(format!(
@@ -183,7 +180,7 @@ fn detail(s: &Snapshot) -> Vec<String> {
         ));
     }
     for (group, why) in &s.refused {
-        rows.push(format!("Twitch refused {}: {why}", label_of(*group)));
+        rows.push(format!("{} refused: {why}", label_of(*group)));
     }
     rows
 }
@@ -197,35 +194,25 @@ fn actions(s: &Snapshot) -> Vec<Node> {
     match s.login {
         Login::In => {
             if !s.missing.is_empty() {
-                rows.push(button("connect", "Grant them on Twitch"));
+                rows.push(Button::new("connect", "Grant access").into());
             }
-            rows.push(button("reconnect", "Reconnect"));
-            rows.push(button("forget", "Forget the token"));
+            rows.push(Button::new("reconnect", "Reconnect").into());
+            rows.push(Button::new("forget", "Forget the token").into());
         }
         Login::Checking => {}
         Login::Out | Login::Expired if s.device_asked => {}
         Login::Out | Login::Expired => {
-            rows.push(Node::Text(
-                "Twitch asks you to approve this client once, in your browser. Nothing is typed here."
-                    .into(),
-            ));
-            rows.push(button("connect", "Connect with Twitch"));
+            rows.push(
+                "You approve this client once, in your browser. Nothing is typed here.".into(),
+            );
+            rows.push(Button::new("connect", "Connect").into());
             if held {
-                rows.push(button("reconnect", "Reconnect"));
-                rows.push(button("forget", "Forget the token"));
+                rows.push(Button::new("reconnect", "Reconnect").into());
+                rows.push(Button::new("forget", "Forget the token").into());
             }
         }
     }
     rows
-}
-
-fn button(id: &str, label: &str) -> Node {
-    Node::Button {
-        id: id.into(),
-        label: label.into(),
-        icon: None,
-        wide: false,
-    }
 }
 
 fn labels(groups: &[Group]) -> String {

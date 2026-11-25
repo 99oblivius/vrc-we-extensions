@@ -863,7 +863,7 @@ impl Twitch {
                     return;
                 };
                 let Some(client) = self.client_id().map(str::to_owned) else {
-                    let why = "Twitch refused the token: connect again.";
+                    let why = "The token was refused: connect again.";
                     self.signed_out(out, Login::Expired, why.into());
                     return;
                 };
@@ -1038,10 +1038,10 @@ impl Twitch {
                         });
                     }
                     (_, Ok(_)) => {
-                        self.error =
-                            Some(protocol::parse_error(&parsed).unwrap_or_else(|| {
-                                format!("Twitch refused the sign-in ({status})")
-                            }));
+                        self.error = Some(
+                            protocol::parse_error(&parsed)
+                                .unwrap_or_else(|| format!("The sign-in was refused ({status})")),
+                        );
                     }
                     (_, Err(e)) => self.error = Some(e),
                 }
@@ -1412,7 +1412,7 @@ impl Twitch {
         match method {
             "clip" => {
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 let title = text(0).unwrap_or_default();
@@ -1434,7 +1434,7 @@ impl Twitch {
             }
             "marker" => {
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 let description = text(0).unwrap_or_default();
@@ -1463,7 +1463,7 @@ impl Twitch {
                     return out;
                 };
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 if message.is_empty() || message.len() > protocol::CHAT_MAX {
@@ -1500,7 +1500,7 @@ impl Twitch {
                     return out;
                 };
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 self.act(
@@ -1526,7 +1526,7 @@ impl Twitch {
                     return out;
                 };
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 self.act(
@@ -1559,7 +1559,7 @@ impl Twitch {
                     return out;
                 }
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 self.act(
@@ -1608,7 +1608,7 @@ impl Twitch {
                     _ => POLL_SECONDS,
                 };
                 let Some(identity) = self.account() else {
-                    self.refuse(&mut out, id, "Not logged in to Twitch.");
+                    self.refuse(&mut out, id, "Not signed in.");
                     return out;
                 };
                 self.act(

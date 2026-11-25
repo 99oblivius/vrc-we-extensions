@@ -1,19 +1,20 @@
-//! The library: named tracks and named positions, kept in the
-//! extension's store and offered to actions by key.
+//! The library: named tracks and positions, kept in the extension's store and
+//! offered to actions.
 
 use serde::{Deserialize, Serialize};
 use vrc_we_sdk::{Command, Item, Value};
 
 use crate::motion::{
-    clamp_step, key_optics, reclose, step_of, Loop, Optics, Step, OPTICS, PATH_MAX, SMOOTH, WIRE,
+    clamp_step, join_ramps, key_optics, key_ramp, ramp_of_pace, reclose, step_of, Loop, Optics,
+    Step, IN_RAMP, OPTICS, OUT_RAMP, PATH_MAX, SMOOTH, WIRE,
 };
 use crate::widgets::UNREADABLE;
 use crate::{
     pose_list, pose_value, steps_of, steps_value, Camera, LIBRARY_KEY, NAME_MAX, POSITIONS, TRACKS,
 };
 
-/// A name as people type it: trimmed, at most [`NAME_MAX`] characters, no
-/// control characters; none when nothing is left.
+/// A name as typed, trimmed and without control characters, at most
+/// [`NAME_MAX`] characters. `None` if it is empty.
 pub(crate) fn clean_name(name: &str) -> Option<String> {
     let name: String = name
         .trim()
@@ -24,8 +25,8 @@ pub(crate) fn clean_name(name: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// `base` when `taken` says it's free, else the first free `base (n)`,
-/// `base` cut so it stays within [`NAME_MAX`] characters.
+/// `base` if it is free, or the first free `base (n)`, at most [`NAME_MAX`]
+/// characters.
 pub(crate) fn free_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
     if !taken(base) {
         return base.to_owned();
@@ -38,29 +39,27 @@ pub(crate) fn free_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Track {
     pub(crate) name: String,
-    /// Its store key: `track_<n>`.
+    /// The store key: `track_<n>`.
     pub(crate) key: String,
     pub(crate) steps: Vec<Step>,
-    /// The world pose its first key was set at: where the editor draws it
-    /// and adds keys from. Plays never read it, and it never leaves this
-    /// client (a track's data is its steps).
+    /// The world pose of the first key, where the editor draws the track and
+    /// adds keys from. It isn't used when playing and isn't shared.
     pub(crate) start: Option<[f32; 6]>,
-    /// Closed, its last step is the way back to its start, kept so by
-    /// every edit ([`reclose`]); looping, a play goes round until stopped.
+    /// How it ends. Every edit keeps the last step of a closed track leading
+    /// back to the start ([`reclose`]).
     pub(crate) looping: Loop,
-    /// The camera's optics at its start; each step holds those at the key
-    /// it reaches. None for a track kept before keys held them: its plays
-    /// leave the settings alone until a key is next set from the camera.
+    /// The camera's optics at the start; the steps hold those of the other
+    /// keys. `None` if the track was saved before keys had optics.
     pub(crate) optics: Option<Optics>,
 }
 
 impl Track {
-    /// Each key's optics, when it holds them.
+    /// The optics at each key, if it has any.
     pub(crate) fn key_optics(&self) -> Option<Vec<Optics>> {
         self.optics.map(|first| key_optics(first, &self.steps))
     }
 
-    /// It holds optics from now on: a track without gives every key `now`.
+    /// Gives every key the optics `now`, if the track has none.
     pub(crate) fn keep_optics(&mut self, now: Optics) {
         if self.optics.is_none() {
             self.optics = Some(now);
@@ -70,19 +69,43 @@ impl Track {
         }
     }
 
-    /// A closed track's last step made the way back to its start again.
-    pub(crate) fn reclose(&mut self) {
-        if self.looping.closed() {
+    /// Edits the track and then restores its invariants: one ramp per key, the
+    /// start keeping its own, and a closed track leading back to its start.
+    pub(crate) fn edit<T>(&mut self, edit: impl FnOnce(&mut Self) -> T) -> T {
+        let start = key_ramp(&self.steps, 0);
+        let result = edit(self);
+        self.settle(start);
+        result
+    }
+
+    /// Restores the track's invariants, where `start` is the ramp of the start.
+    fn settle(&mut self, start: f32) {
+        let closed = self.looping.closed();
+        join_ramps(&mut self.steps, start, closed);
+        if closed {
             reclose(&mut self.steps, self.optics);
         }
+    }
+
+    /// Sets the ramp of key `key`. The end of a closed track is its start.
+    pub(crate) fn set_ramp(&mut self, key: usize, ramp: f32) {
+        let start = match key {
+            0 => ramp,
+            k if k == self.steps.len() && self.looping.closed() => ramp,
+            _ => key_ramp(&self.steps, 0),
+        };
+        if let Some(s) = key.checked_sub(1).and_then(|i| self.steps.get_mut(i)) {
+            s[IN_RAMP] = ramp;
+        }
+        self.settle(start);
     }
 
     pub(crate) fn seconds(&self) -> f32 {
         self.steps.iter().map(|s| s[6]).sum()
     }
 
-    /// Its keys: the start, then the end of each step; none until it has
-    /// either.
+    /// The number of keys: the start and the end of each step, or 0 for an
+    /// empty track.
     pub(crate) fn keys(&self) -> usize {
         match (self.start, self.steps.len()) {
             (None, 0) => 0,
@@ -95,25 +118,65 @@ impl Track {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Position {
     pub(crate) name: String,
-    /// What actions pick it by: `pos_<n>`; a library saved before keys
-    /// gets them when it loads.
+    /// The key actions pick it by: `pos_<n>`. Assigned on load if it was saved
+    /// without one.
     #[serde(default)]
     pub(crate) key: String,
     pub(crate) pose: [f32; 6],
 }
 
-/// What the `library` key holds; each track's steps are under its key.
+/// The value of the `library` key. Each track's steps are under the track's own
+/// key.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Index {
     pub(crate) next: u32,
     pub(crate) tracks: Vec<TrackEntry>,
     pub(crate) positions: Vec<Position>,
-    /// The handle lengths a new key takes (out, in): the last chosen key's.
+    /// The handle lengths of a new key (out, in).
     #[serde(default)]
     pub(crate) key_handles: Option<[f32; 2]>,
-    /// The chosen track, by key.
+    /// The key of the selected track.
     #[serde(default)]
     pub(crate) chosen: Option<String>,
+}
+
+/// The value of a track's key. A bare list of steps is the older format, with
+/// pace dots in place of ramps ([`from_dots`]).
+#[derive(Debug, Serialize, Deserialize)]
+struct Kept<T> {
+    steps: T,
+}
+
+/// Converts pace dots (a position along the step from 0 to 1, and the pace
+/// there relative to the average) to the closest ramps. A dot near an end of
+/// its step sets the pace of that key, a dot in the middle sets both, and a key
+/// with two paces takes their mean.
+fn from_dots(steps: &mut [Step]) {
+    let asked = |[at, pace]: [f32; 2]| match (pace == 1.0, at) {
+        (true, _) => [None, None],
+        (false, at) if at < 1.0 / 3.0 => [Some(pace), None],
+        (false, at) if at > 2.0 / 3.0 => [None, Some(pace)],
+        _ => [Some(3.0 - 2.0 * pace); 2],
+    };
+    let asks: Vec<[Option<f32>; 2]> = steps
+        .iter()
+        .map(|s| asked([s[OUT_RAMP], s[IN_RAMP]]))
+        .collect();
+    let ramp = |key: usize| {
+        let into = key.checked_sub(1).and_then(|i| asks[i][1]);
+        let out = asks.get(key).and_then(|a| a[0]);
+        let pace = match (into, out) {
+            (Some(a), Some(b)) => (a + b) / 2.0,
+            (a, b) => a.or(b).unwrap_or(1.0),
+        };
+        ramp_of_pace(pace)
+    };
+    let start = ramp(0);
+    let reached: Vec<f32> = (1..=steps.len()).map(ramp).collect();
+    for (s, ramp) in steps.iter_mut().zip(reached) {
+        s[IN_RAMP] = ramp;
+    }
+    join_ramps(steps, start, false);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -164,9 +227,12 @@ impl Camera {
         }
         self.library_changed = true;
         let t = &self.tracks[i];
+        let kept = Kept {
+            steps: t.steps.as_slice(),
+        };
         out.push(Command::Store {
             key: t.key.clone(),
-            value: serde_json::to_string(&t.steps).expect("steps serialize"),
+            value: serde_json::to_string(&kept).expect("steps serialize"),
         });
     }
 
@@ -218,32 +284,50 @@ impl Camera {
             );
             return;
         }
-        let stored: Vec<Vec<f32>> = match serde_json::from_str(&value) {
-            Ok(stored) => stored,
-            Err(_) => {
-                self.unreadable = true;
-                self.note = Some(UNREADABLE.to_owned());
-                return;
-            }
+        let dotted = value.starts_with('[');
+        let stored: Result<Vec<Vec<f32>>, _> = match dotted {
+            true => serde_json::from_str(&value),
+            false => serde_json::from_str(&value).map(|Kept { steps }| steps),
         };
-        if let Some(t) = self.tracks.iter_mut().find(|t| t.key == key) {
-            t.steps = stored
-                .iter()
-                .filter_map(|s| step_of(s))
-                .take(PATH_MAX)
-                .map(clamp_step)
-                .collect();
+        let Ok(stored) = stored else {
+            self.unreadable = true;
+            self.note = Some(UNREADABLE.to_owned());
+            return;
+        };
+        let Some(i) = self.tracks.iter().position(|t| t.key == key) else {
+            return;
+        };
+        let t = &mut self.tracks[i];
+        t.steps = stored
+            .iter()
+            .filter_map(|s| {
+                let mut step = step_of(s)?;
+                // A step without a curve has an even pace.
+                if dotted && s.len() < WIRE {
+                    step[OUT_RAMP..=IN_RAMP].copy_from_slice(&[0.5, 1.0]);
+                }
+                Some(step)
+            })
+            .take(PATH_MAX)
+            .collect();
+        if dotted {
+            from_dots(&mut t.steps);
+        }
+        t.steps.iter_mut().for_each(|s| *s = clamp_step(*s));
+        t.settle(key_ramp(&t.steps, 0));
+        if dotted {
+            self.save_track(i, out);
         }
     }
 
-    /// The chosen track's key.
+    /// The key of the selected track.
     pub(crate) fn chosen_key(&self) -> Option<String> {
         self.track
             .and_then(|i| self.tracks.get(i))
             .map(|t| t.key.clone())
     }
 
-    /// The lists actions pick from, as they stand.
+    /// Publishes the lists that actions pick from.
     pub(crate) fn publish_lists(&self, out: &mut Vec<Command>) {
         let item = |key: &str, label: &str| Item {
             key: key.to_owned(),
@@ -263,8 +347,8 @@ impl Camera {
         });
     }
 
-    /// The data of item `key` of `list`: a track's steps or a position's
-    /// pose; none once it's gone.
+    /// The data of an item: a track's steps or a position's pose. `None` if it
+    /// no longer exists.
     pub(crate) fn resolve(&self, list: &str, key: &str) -> Value {
         match list {
             TRACKS => self
@@ -281,9 +365,8 @@ impl Camera {
         }
     }
 
-    /// An item a mapping brought from another client: an identical one
-    /// here is reused, else it's kept as `label`, or `label (n)` when a
-    /// name is taken. The item it is now.
+    /// Adds an item that came with a mapping from another client, or finds an
+    /// identical one, and returns it. Its name is made unique.
     pub(crate) fn on_import(
         &mut self,
         list: &str,
@@ -297,11 +380,13 @@ impl Camera {
         let name = || clean_name(label).unwrap_or_else(|| "Imported".to_owned());
         match list {
             TRACKS => {
-                let steps: Vec<Step> = steps_of(data)
+                let mut steps: Vec<Step> = steps_of(data)
                     .into_iter()
                     .take(PATH_MAX)
                     .map(clamp_step)
                     .collect();
+                let start = key_ramp(&steps, 0);
+                join_ramps(&mut steps, start, false);
                 let same = |t: &Track| {
                     t.steps.len() == steps.len()
                         && t.steps
@@ -355,15 +440,14 @@ impl Camera {
         self.positions.iter().any(|p| p.name == name)
     }
 
-    /// A store key no item has: `<prefix>_<n>`.
+    /// A new store key: `<prefix>_<n>`.
     pub(crate) fn fresh_key(&mut self, prefix: &str) -> String {
         let key = format!("{prefix}_{}", self.next_key);
         self.next_key += 1;
         key
     }
 
-    /// Keeps `steps` from `start` as a new track `name`, chosen, in the
-    /// store.
+    /// Adds and selects a track, and stores it.
     pub(crate) fn insert_track(
         &mut self,
         name: String,
@@ -386,20 +470,17 @@ impl Camera {
         self.save_index(out);
     }
 
-    /// `base` when no track has it, else `base (n)`.
+    /// `base` if no track has that name, or the first free `base (n)`.
     pub(crate) fn copy_name(&self, base: &str) -> String {
         free_name(base, |n| self.name_taken(n))
     }
 
-    /// Edits the chosen track's steps and stores them, a closed one's way
-    /// back kept leading to its start.
+    /// Edits the steps of the selected track and stores it.
     pub(crate) fn edit_track(&mut self, edit: impl FnOnce(&mut Vec<Step>), out: &mut Vec<Command>) {
         let Some(i) = self.track.filter(|i| *i < self.tracks.len()) else {
             return;
         };
-        let t = &mut self.tracks[i];
-        edit(&mut t.steps);
-        t.reclose();
+        self.tracks[i].edit(|t| edit(&mut t.steps));
         self.save_track(i, out);
     }
 }

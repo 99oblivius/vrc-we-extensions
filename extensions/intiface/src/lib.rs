@@ -529,7 +529,7 @@ impl Intiface {
                 view,
             });
         }
-        let status = page::line(state);
+        let status = page::bar(state);
         if self.shown_status.as_ref() != Some(&status) {
             self.shown_status = Some(status.clone());
             out.push(Command::Status(Some(status)));
@@ -881,10 +881,7 @@ mod tests {
             id: opened(&out).unwrap(),
             error: Some("connection refused".into()),
         });
-        assert_eq!(
-            line(&out),
-            Some((Tone::Idle, "Intiface isn't running".to_owned()))
-        );
+        assert_eq!(line(&out), Some((Tone::Idle, "Not running".to_owned())));
         assert_eq!(t.error, None);
     }
 
@@ -937,7 +934,7 @@ mod tests {
         ));
         assert_eq!(
             line(&out),
-            Some((Tone::Bad, "Intiface refused this client".to_owned()))
+            Some((Tone::Bad, "Refused this client".to_owned()))
         );
         assert_eq!(timer(&out, "retry"), None);
         assert_eq!(opened(&fire(&mut t, "retry")), None);

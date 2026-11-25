@@ -15,7 +15,7 @@ Run Intiface Central and start its server. This extension connects to `ws://127.
 | namespace | `@INTIFACE`: `connected`, `devices`, `level` |
 | methods | `vibrate(intensity, seconds, device to none)`, `stop()`, both open to a contact who controls you |
 | page | `intiface`: its state, its devices, the strongest allowed, stop, scan, reconnect |
-| status | a line in the status bar |
+| status | a line in the status bar, with Intiface's logo |
 | actions | Vibrate, Stop all devices |
 | conditions | Connected, Connected devices |
 | network | this computer, TCP 12345 |
@@ -31,11 +31,11 @@ Run Intiface Central and start its server. This extension connects to `ws://127.
 
 | Line | Colour | When |
 |---|---|---|
-| Intiface isn't running | grey | nothing answers on its port, and it keeps looking |
+| Not running | grey | nothing answers on its port, and it keeps looking |
 | Connecting | yellow | a first try, or a server that was there is on its way back |
 | Waiting for a device | yellow | Intiface answered and has nothing to drive |
 | Connected | green | Intiface answered and has a device. The `connected` field is true only here |
-| Intiface refused this client | red | usually an Intiface older than Buttplug spec 4. It holds until Reconnect |
+| Refused this client | red | usually an Intiface older than Buttplug spec 4. It holds until Reconnect |
 
 ## How it stops
 

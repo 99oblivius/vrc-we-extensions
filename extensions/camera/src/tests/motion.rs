@@ -3,11 +3,11 @@ use crate::*;
 
 use super::support::*;
 use crate::motion::{
-    dot_place, legs, pace, progress, Follow, DOT_AT, DOT_PACE, FRAME, IN_LEN, OPTICS, OUT_LEN,
-    SMOOTH, WIRE,
+    height, key_ramp, key_times, pose_at, ramps, Follow, Leg, Path, FRAME, IN_LEN, IN_RAMP, OPTICS,
+    OUT_LEN, OUT_RAMP, SMOOTH, WIRE,
 };
 use glam::Quat;
-use vrc_we_sdk::UiEvent;
+use vrc_we_sdk::{Drawn, Piece, UiEvent};
 
 #[test]
 fn nothing_moves_before_vrchat_reports_a_pose() {
@@ -274,42 +274,173 @@ fn a_step_moves_as_far_as_the_time_since_the_last_tick() {
     );
 }
 
+/// The legs of a path, measured and paced.
+fn legs(steps: &[Step], closed: bool) -> Vec<Leg> {
+    let mut path = Path::new(steps, closed);
+    (0..steps.len())
+        .map(|i| path.leg(i).expect("a leg a step").clone())
+        .collect()
+}
+
+/// Steps along +z, each (metres, seconds, the ramp leaving, arriving).
+fn ramped(steps: &[[f32; 4]]) -> Vec<Step> {
+    steps
+        .iter()
+        .map(|[m, s, out, into]| curved([0.0, 0.0, *m, 0.0, 0.0, 0.0, *s], [0.0, 0.0, *out, *into]))
+        .collect()
+}
+
+/// A track of `keys` ramps, `seconds` and `metres` apart.
+fn track(ramps: &[f32], seconds: f32, metres: f32) -> Vec<Step> {
+    let steps: Vec<[f32; 4]> = ramps
+        .windows(2)
+        .map(|r| [metres, seconds, r[0], r[1]])
+        .collect();
+    ramped(&steps)
+}
+
+/// How fast `leg` goes `t` (0–1) of the way through its time.
+fn speed(leg: &Leg, t: f32) -> f32 {
+    let d = 1e-3;
+    let (a, b) = ((t - d).max(0.0), (t + d).min(1.0));
+    leg.at(b).pos.distance(leg.at(a).pos) / ((b - a) * leg.seconds)
+}
+
 #[test]
-fn a_dots_pace_keeps_its_steps_time_passes_its_dot_and_mirrors_about_1() {
-    for at in [0.0, 0.1, 0.5, 0.9, 1.0] {
-        for p in [0.05, 0.5, 1.0, 1.5, 2.0] {
-            assert!(
-                (progress(at, p, 1.0) - 1.0).abs() < 1e-5,
-                "on time: {at} {p}"
-            );
-            let c = dot_place(at);
-            assert!(
-                (progress(at, p, c) - c).abs() < 1e-5,
-                "the dot at its share"
-            );
-            assert!((pace(at, p, c) - p).abs() < 1e-5, "through the dot");
-            assert!((pace(at, p, 0.0) - 1.0).abs() < 1e-5 && (pace(at, p, 1.0) - 1.0).abs() < 1e-5);
-            let mut last = 0.0;
-            for k in 0..=200 {
-                let t = k as f32 / 200.0;
-                let v = pace(at, p, t);
-                assert!(v.is_finite() && v >= 0.0, "never below 0: {at} {p} {t} {v}");
-                assert!(
-                    (v + pace(at, 2.0 - p, t) - 2.0).abs() < 1e-4,
-                    "mirrors about 1"
-                );
-                let f = progress(at, p, t);
-                assert!(f >= last - 1e-6, "never back: {at} {p} {t}");
-                last = f;
+fn whatever_the_ramps_a_leg_covers_its_distance_in_its_time_and_never_goes_back() {
+    let all = [-100.0, -60.0, 0.0, 35.0, 100.0];
+    for out in all {
+        for into in all {
+            for (before, after) in [(0.02, 4.0), (1.0, 1.0), (4.0, 0.02)] {
+                let steps = ramped(&[
+                    [1.0, before, into, out],
+                    [3.0, 1.0, out, into],
+                    [1.0, after, into, out],
+                ]);
+                for leg in legs(&steps, false) {
+                    let mut last = 0.0;
+                    for k in 0..=200 {
+                        let f = leg.reached(k as f32 / 200.0);
+                        assert!(
+                            f.is_finite() && f >= last - 1e-5 && f <= 1.0,
+                            "{out} {into} {k}: {f} after {last}"
+                        );
+                        last = f;
+                    }
+                    assert!((last - 1.0).abs() < 1e-3, "all of it: {out} {into} {last}");
+                }
             }
         }
     }
-    for k in 0..=10 {
-        let t = k as f32 / 10.0;
-        assert!(
-            (progress(0.3, 1.0, t) - t).abs() < 1e-6,
-            "a dot at 1 is an even pace"
+}
+
+#[test]
+fn a_key_is_passed_at_one_speed_and_its_ramp_is_its_own() {
+    // Three legs of differing speeds.
+    let steps = ramped(&[
+        [2.0, 2.0, 0.0, 40.0],
+        [6.0, 2.0, 40.0, -30.0],
+        [1.0, 1.0, -30.0, 0.0],
+    ]);
+    let legs = legs(&steps, false);
+    for pair in legs.windows(2) {
+        let (into, out) = (speed(&pair[0], 1.0), speed(&pair[1], 0.0));
+        assert!((into - out).abs() < 0.05 * into.max(1.0), "{into} {out}");
+    }
+    let ramp = ramps(&steps, false);
+    for pair in ramp.windows(2) {
+        assert_eq!(pair[0].heights[1], pair[1].heights[0]);
+        assert_eq!(
+            pair[0].slopes[1], pair[1].slopes[0],
+            "it leaves as it arrived"
         );
+    }
+    let mut moved = steps.clone();
+    moved[0][IN_RAMP] = -80.0;
+    moved[1][OUT_RAMP] = -80.0;
+    moved[0][6] = 0.5;
+    let after = ramps(&moved, false);
+    assert_eq!(after[0].heights[0], ramp[0].heights[0]);
+    assert_eq!(after[1].heights[1], ramp[1].heights[1]);
+    assert_eq!(after[2].heights, ramp[2].heights, "no other key moves");
+    // Four legs away nothing at all.
+    let long = track(&[0.0, 30.0, -20.0, 50.0, 0.0, 10.0], 1.0, 1.0);
+    let mut other = long.clone();
+    other[0][OUT_RAMP] = 90.0;
+    assert_eq!(ramps(&long, false)[3..], ramps(&other, false)[3..]);
+}
+
+#[test]
+fn a_ramp_stays_in_its_band_and_a_key_at_its_foot_stops() {
+    for keys in [
+        [0.0, 100.0, -100.0, 100.0, 0.0],
+        [-100.0, -100.0, 100.0, 100.0, -100.0],
+        [0.0, 80.0, 90.0, -95.0, 100.0],
+    ] {
+        for seconds in [0.05, 1.0, 9.0] {
+            let mut steps = track(&keys, seconds, 1.0);
+            steps[1][6] = 0.02;
+            for (ramp, step) in ramps(&steps, false).iter().zip(&steps) {
+                for k in 0..=100 {
+                    let h = ramp.at(k as f32 / 100.0, step[6]);
+                    assert!((-1e-4..=1.0 + 1e-4).contains(&h), "{keys:?}: {h}");
+                }
+            }
+        }
+    }
+    let slowed = legs(&track(&[0.0, -100.0, 0.0], 1.0, 2.0), false);
+    assert!(speed(&slowed[0], 1.0) < 0.05, "it stops at the key");
+    assert!(speed(&slowed[1], 0.0) < 0.05);
+    let stops = legs(&track(&[-100.0, -100.0], 1.0, 2.0), false);
+    assert!(
+        (stops[0].at(1.0).pos.z - 2.0).abs() < 1e-3,
+        "and still arrives"
+    );
+}
+
+#[test]
+fn keys_closer_together_are_flown_between_faster() {
+    let peak = |seconds: f32| {
+        let mut steps = track(&[0.0, 20.0, -20.0, 0.0], 2.0, 2.0);
+        steps[1][6] = seconds;
+        let leg = &legs(&steps, false)[1];
+        (0..=50)
+            .map(|k| speed(leg, k as f32 / 50.0))
+            .fold(0.0, f32::max)
+    };
+    assert!(peak(0.4) > 3.0 * peak(2.0), "{} {}", peak(0.4), peak(2.0));
+}
+
+#[test]
+fn a_hold_a_jump_and_a_turn_in_place_break_the_speed_from_leg_to_leg() {
+    let turn = lin([0.0, 0.0, 0.0, 0.0, 90.0, 0.0, 1.0]);
+    let hold = lin([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    let jump = lin([0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0]);
+    for beside in [turn, hold, jump] {
+        let steps = [lin([0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0]), beside];
+        let legs = legs(&steps, false);
+        for k in 0..=10 {
+            let t = k as f32 / 10.0;
+            assert!((legs[0].reached(t) - t).abs() < 1e-5, "even to its end");
+        }
+    }
+    // Two turns in place run on from one into the other.
+    let turns = [turn, lin([0.0, 0.0, 0.0, 0.0, 30.0, 0.0, 1.0])];
+    let legs = legs(&turns, false);
+    assert!(legs[0].reached(0.9) > 0.9, "the faster slows into the key");
+}
+
+#[test]
+fn a_place_on_a_track_is_where_a_play_of_it_is() {
+    let steps = track(&[0.0, 60.0, -40.0, 0.0], 1.0, 2.0);
+    for closed in [false, true] {
+        let whole = legs(&steps, closed);
+        for (i, leg) in whole.iter().enumerate() {
+            for t in [0.0, 0.3, 0.7, 1.0] {
+                let at = pose_at(&[0.0; 6], &steps, closed, i, t);
+                assert!((at[2] - leg.at(t).pos.z).abs() < 1e-4, "{i} {t}");
+            }
+        }
     }
 }
 
@@ -412,23 +543,20 @@ fn a_hold_gets_no_handle_and_a_hold_or_a_jump_breaks_the_curve() {
 }
 
 #[test]
-fn every_key_is_reached_at_its_time_whatever_its_dot() {
+fn every_key_is_reached_at_its_time_whatever_its_ramp() {
     let mut cam = known([0.0; 6]);
     cam.handle(fly(
         1,
-        &[
-            curved([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5], [0.0, 0.0, 0.2, 1.8]),
-            curved([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5], [0.0, 0.0, 0.9, 0.3]),
-        ],
+        &ramped(&[[1.0, 0.5, 0.0, 90.0], [1.0, 0.5, 90.0, -70.0]]),
     ));
     let (poses, ids) = run_plays(&mut cam, 1000);
     let ticks = (0.5 / FRAME).round() as usize;
     assert!(
-        (poses[ticks - 1][2] - 1.0).abs() < 1e-4,
+        (poses[ticks - 1][2] - 1.0).abs() < 1e-3,
         "key 1 at 0.5 s: {:?}",
         poses[ticks - 1]
     );
-    assert!((poses.last().unwrap()[2] - 2.0).abs() < 1e-4);
+    assert!((poses.last().unwrap()[2] - 2.0).abs() < 1e-3);
     assert_eq!(poses.len(), 2 * ticks, "the end at 1 s, not a tick late");
     assert_eq!(ids, [1]);
 }
@@ -490,17 +618,7 @@ fn linear_and_smooth_reset_a_keys_handles_and_a_new_key_takes_the_last_chosen() 
         (0.0, 0.0),
         "the new key takes them"
     );
-    let sliders = |cam: &Camera| {
-        let mut ids = Vec::new();
-        if let (Some(Node::Column(rows)), _) = editor_nodes(cam) {
-            for r in rows {
-                if let Node::Slider { id, .. } = r {
-                    ids.push(id);
-                }
-            }
-        }
-        ids
-    };
+    let sliders = |cam: &Camera| sliders_shown(cam, &["in_len", "out_len"]);
     cam.handle(chosen(EDITOR, "timeline", 0));
     assert_eq!(sliders(&cam), ["out_len"], "the start has no way in");
     cam.handle(chosen(EDITOR, "timeline", 4));
@@ -518,57 +636,153 @@ fn linear_and_smooth_reset_a_keys_handles_and_a_new_key_takes_the_last_chosen() 
 }
 
 #[test]
-fn a_dragged_dot_paces_its_step_and_the_track_is_kept_once_let_go() {
-    let (mut cam, _) = with_track(
-        "Orbit",
-        &[
-            lin([0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0]),
-            lin([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-            lin([0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0]),
-        ],
-    );
+fn a_dragged_key_sets_its_time_and_ramp_and_the_track_is_kept_once_let_go() {
+    let (mut cam, _) = with_track("Orbit", &track(&[0.0, 0.0, 0.0, 0.0], 2.0, 2.0));
     cam.handle(press("open_editor"));
-    let (_, lane) = editor_nodes(&cam);
-    let lane = lane.expect("a lane");
-    assert_eq!(lane.dots.len(), 2, "a jump has no dot");
-    assert_eq!((lane.dots[1].from, lane.dots[1].to), (2.0, 4.0));
-    let drag = |done| {
-        ui(
-            EDITOR,
-            UiEvent::Dragged {
-                id: "timeline".into(),
-                index: 1,
-                at: 2.5,
-                value: 1.5,
-                done,
-            },
-        )
+    let plot = |cam: &Camera| timeline_of(cam.shown_editor.as_ref().unwrap()).cloned();
+    let at = |cam: &Camera| -> Vec<[f32; 2]> {
+        plot(cam)
+            .expect("a timeline")
+            .points()
+            .map(|p| p.at)
+            .collect()
     };
-    let out = cam.handle(drag(false));
-    let s = cam.tracks[0].steps[2];
-    assert!(
-        (s[DOT_AT] - 0.25).abs() < 1e-5 && s[DOT_PACE] == 1.5,
-        "{s:?}"
-    );
+    assert_eq!(at(&cam), [[0.0, 0.5], [2.0, 0.5], [4.0, 0.5], [6.0, 0.5]]);
+    let out = cam.handle(drag_key(1, 2.5, 0.8, false));
+    assert_eq!(at(&cam), [[0.0, 0.5], [2.5, 0.8], [4.0, 0.5], [6.0, 0.5]]);
     assert!(stored(&out).is_empty(), "nothing kept while it moves");
-    let out = cam.handle(drag(true));
+    let out = cam.handle(drag_key(1, 2.5, 0.8, true));
     assert!(
         stored(&out).iter().any(|(k, _)| k == "track_0"),
         "kept once let go"
     );
+    let steps = cam.tracks[0].steps.clone();
+    assert_eq!(steps[0][IN_RAMP], steps[1][OUT_RAMP], "one ramp a key");
+    cam.handle(drag_key(0, 9.0, 0.0, true));
+    assert_eq!(at(&cam)[0], [0.0, 0.0], "the start in height alone");
+    // Its curve is one Bezier a leg, through every key.
+    let curve = plot(&cam).unwrap().items.iter().find_map(|i| match i {
+        Drawn::Curve(c) => Some(c.clone()),
+        _ => None,
+    });
+    let ends: Vec<[f32; 2]> = curve
+        .expect("a curve")
+        .pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Cubic(_, _, to) => *to,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(ends, at(&cam)[1..]);
     let (mut long, _) = with_track("Long", &vec![FORWARD; 257]);
     long.handle(press("open_editor"));
+    let long_plot = plot(&long).unwrap();
     assert!(
-        editor_nodes(&long).1.is_none(),
-        "too long a track has no lane"
+        long_plot
+            .points()
+            .all(|p| p.drag.is_some_and(|d| d.y.is_none() && !d.live)),
+        "too long a track has no ramp, and a key moves once let go"
     );
+    let before = long.tracks[0].steps[0];
+    long.handle(drag_key(1, 0.1, 0.0, true));
+    assert_eq!(long.tracks[0].steps[0][IN_RAMP], before[IN_RAMP]);
+    assert!((key_times(&long.tracks[0].steps)[1] - 0.1).abs() < 1e-6);
+    long.handle(chosen(EDITOR, "timeline", 1));
     assert!(shown(&long, true)
         .iter()
-        .any(|t| t.starts_with("Pace is edited")));
+        .any(|t| t.starts_with("Ramps are edited")));
 }
 
 #[test]
-fn an_old_track_of_7_numbers_loads_straight_at_an_even_pace_and_steps_round_trip() {
+fn a_keys_ramp_stays_its_own_through_every_edit() {
+    let of = |cam: &Camera| -> Vec<f32> {
+        let steps = &cam.tracks[0].steps;
+        (0..=steps.len()).map(|k| key_ramp(steps, k)).collect()
+    };
+    let joined = |cam: &Camera| {
+        let steps = &cam.tracks[0].steps;
+        steps.windows(2).all(|w| w[0][IN_RAMP] == w[1][OUT_RAMP])
+    };
+    let ramps = [-100.0, 10.0, 20.0, 30.0];
+    let make = || {
+        let (mut cam, _) = with_track("Orbit", &track(&ramps, 1.0, 1.0));
+        cam.handle(press("open_editor"));
+        cam
+    };
+    let mut cam = make();
+    cam.handle(chosen(EDITOR, "timeline", 1));
+    cam.handle(edit("key_del"));
+    assert_eq!(of(&cam), [-100.0, 20.0, 30.0], "the start keeps its own");
+    assert!(joined(&cam));
+    let mut cam = make();
+    cam.handle(chosen(EDITOR, "timeline", 2));
+    cam.handle(edit("key_earlier"));
+    assert_eq!(of(&cam), [-100.0, 20.0, 10.0, 30.0]);
+    cam.handle(edit("key_dup"));
+    assert_eq!(of(&cam), [-100.0, 20.0, 20.0, 10.0, 30.0]);
+    assert!(joined(&cam));
+    let mut cam = make();
+    cam.handle(chosen(EDITOR, "timeline", 0));
+    cam.handle(edit("key_insert"));
+    assert_eq!(
+        of(&cam),
+        [-100.0, 0.0, 10.0, 20.0, 30.0],
+        "a new key's is even"
+    );
+    assert!(joined(&cam));
+    let mut cam = make();
+    cam.handle(chosen(EDITOR, "loop", 1));
+    assert_eq!(of(&cam), [-100.0, 10.0, 20.0, 30.0, -100.0]);
+    cam.handle(drag_key(4, 4.0, 0.6, true));
+    assert_eq!(
+        of(&cam)[0],
+        of(&cam)[4],
+        "a closed track's end is its start"
+    );
+    assert!((of(&cam)[0] - 20.0).abs() < 1e-3);
+    cam.handle(chosen(EDITOR, "loop", 0));
+    assert_eq!(of(&cam), [20.0, 10.0, 20.0, 30.0]);
+}
+
+#[test]
+fn a_track_kept_with_pace_dots_loads_with_the_ramps_closest_to_them_once() {
+    let (mut cam, _) = with_track("Orbit", &[FORWARD]);
+    let step = |at: f32, pace: f32| format!("[0,0,1,0,0,0,1,1,1,{at},{pace},0,0,0,0]");
+    let value = format!(
+        "[{},{},{},{}]",
+        step(0.0, 0.05),
+        step(1.0, 0.05),
+        step(0.0, 0.05),
+        step(0.5, 1.0)
+    );
+    let load = |cam: &mut Camera, value: String| {
+        cam.handle(Event::Loaded {
+            key: "track_0".into(),
+            value: Some(value),
+        })
+    };
+    let out = load(&mut cam, value);
+    let steps = cam.tracks[0].steps.clone();
+    let heights: Vec<f32> = (0..=4).map(|k| height(key_ramp(&steps, k))).collect();
+    for slow in [0, 2] {
+        assert!(heights[slow] < 0.15, "a slow key: {heights:?}");
+    }
+    for even in [1, 3, 4] {
+        assert!(
+            (heights[even] - 0.5).abs() < 1e-4,
+            "an even one: {heights:?}"
+        );
+    }
+    let kept = stored(&out);
+    let (_, value) = kept.iter().find(|(k, _)| k == "track_0").expect("kept");
+    let out = load(&mut cam, value.clone());
+    assert_eq!(cam.tracks[0].steps, steps, "kept as it is now");
+    assert!(stored(&out).is_empty(), "converted once");
+}
+
+#[test]
+fn an_old_track_of_7_numbers_loads_straight_on_an_even_ramp_and_steps_round_trip() {
     let (mut cam, _) = with_track("Orbit", &[FORWARD]);
     cam.handle(Event::Loaded {
         key: "track_0".into(),
@@ -580,7 +794,7 @@ fn an_old_track_of_7_numbers_loads_straight_at_an_even_pace_and_steps_round_trip
     );
     let steps = vec![curved(
         [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-        [0.5, 0.75, 0.25, 1.75],
+        [0.5, 0.75, -25.0, 75.0],
     )];
     assert_eq!(steps_of(&steps_value(&steps)), steps);
 }
@@ -603,16 +817,7 @@ fn closing_a_track_adds_the_way_back_kept_by_every_edit_and_joins_its_start() {
             .any(|(k, v)| k == LIBRARY_KEY && v.contains("\"looping\":\"closed\"")),
         "kept"
     );
-    let sliders = |cam: &Camera| match editor_nodes(cam).0 {
-        Some(Node::Column(rows)) => rows
-            .into_iter()
-            .filter_map(|r| match r {
-                Node::Slider { id, .. } => Some(id),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
+    let sliders = |cam: &Camera| sliders_shown(cam, &["in_len", "out_len"]);
     cam.handle(chosen(EDITOR, "timeline", 0));
     assert_eq!(
         sliders(&cam),
@@ -640,7 +845,7 @@ fn closing_a_track_adds_the_way_back_kept_by_every_edit_and_joins_its_start() {
     cam.handle(chosen(EDITOR, "timeline", 5));
     cam.handle(edit("key_del"));
     assert_eq!(n(&cam), 5, "the end of a closed track stays");
-    assert!(cam.note.as_deref().is_some_and(|t| t.contains("Open")));
+    assert!(cam.note.as_deref().is_some_and(|t| t.contains("play once")));
     cam.handle(chosen(EDITOR, "timeline", 4));
     cam.handle(edit("key_later"));
     assert_eq!(cam.key, Some(4), "no key moves past the way back");
@@ -784,6 +989,7 @@ fn smoothing_is_done_here_with_vrchats_off_while_this_drives_and_back_on_at_rest
 fn the_smoothing_slider_reaches_0_to_switch_smoothing_off() {
     let mut cam = known([0.0; 6]);
     cam.handle(press("open_editor"));
+    cam.handle(chosen(EDITOR, "tab", 2));
     let slider = |cam: &Camera| {
         shown(cam, true)
             .into_iter()

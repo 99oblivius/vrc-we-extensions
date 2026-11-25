@@ -1,74 +1,64 @@
-//! The pieces a view is built from: buttons, fields and sliders, the pace
-//! lane, the key panel. Nodes and the numbers they show, never state.
+//! The parts the views are built from. They depend only on their arguments.
 
-use vrc_we_sdk::{Lane, LaneCurve, LaneDot, Node};
-
-use crate::motion::{
-    dot_place, key_times, pace, Step, DOT_AT, DOT_PACE, HANDLE_MAX, IN_LEN, OUT_LEN, PACE_RANGE,
-    PATH_MAX,
+use vrc_we_sdk::{
+    Axis, Button, Curve, Drag, Flow, Frame, Ink, Input, Line, Marks, Node, Number, Piece, Plot,
+    Point, Scroll, Size, Slider, Stroke, Surface, Text,
 };
 
-/// How long a press on a position takes to fly there.
+use crate::motion::{
+    height, key_ramp, key_times, ramps, Step, HANDLE_MAX, IN_LEN, OUT_LEN, PATH_MAX,
+};
+
+/// The duration of a flight to a position, in seconds.
 pub(crate) const GO_SECONDS: f32 = 2.0;
 
-/// The seconds an added key takes from the one before.
+/// The duration of a new key's step, in seconds.
 pub(crate) const KEY_SECONDS: f32 = 2.0;
 
-/// The most points the 3D view draws a track's curve with, and the most
-/// one leg takes: a long track draws each leg with fewer.
+/// The most points used to draw a track in the 3D view, and the most per leg.
 pub(crate) const PATH_POINTS: usize = 1024;
 pub(crate) const LEG_POINTS: usize = 16;
 
-/// The longest track the timeline shows a pace lane for, the most points
-/// each of its curves takes, and the most one step takes: a longer track
-/// would build a view past a dispatch's fuel.
-pub(crate) const LANE_STEPS_MAX: usize = 256;
-pub(crate) const LANE_POINTS: usize = 256;
-pub(crate) const LANE_STEP_POINTS: usize = 24;
+/// The most steps for which the timeline shows ramps. Building the view of a
+/// longer track takes too much fuel.
+pub(crate) const RAMP_STEPS_MAX: usize = 256;
 
-pub(crate) const LANE_TOO_LONG: &str =
-    "Pace is edited on tracks of up to 256 keys; its pace still plays.";
+pub(crate) const RAMP_TOO_LONG: &str =
+    "Ramps are edited on tracks of up to 256 keys; a longer track's still play.";
 
-/// A step's move and turn as the editor names them, in a step's order.
+/// The labels of a step's move and turn, in order.
 pub(crate) const STEP_LABELS: [&str; 6] = ["Right", "Up", "Forward", "Pitch", "Yaw", "Roll"];
 
-/// The pads' keys, after the 3D view's own mouse controls.
-pub(crate) const HINT: &str =
-    "W A S D move · Space, Shift rise and sink · arrows turn · Q, E roll · \
-                    wheel while one is held: speed";
+/// The keyboard controls, shown below the 3D view's mouse controls.
+pub(crate) const HINT: &str = "W A S D: move · Space, Shift: up, down\n\
+                               Arrows: turn · Q, E: roll\n\
+                               Wheel while moving or looking: speed";
 
-/// What the pads move until VRChat reports where its camera is.
+/// Shown while there is no camera in VRChat to move.
 pub(crate) const STAND_IN: &str = "Until then, the pads, keys and plays move a stand-in here.";
 
-/// What the page and the editor say when a stored library value wouldn't
-/// read: nothing shows, nothing is saved over it, and one press replaces it.
+/// Shown when a stored value can't be read. Nothing is saved over it until the
+/// user starts a new library.
 pub(crate) const UNREADABLE: &str =
     "This client couldn't read a stored camera library, so it shows and saves nothing over it.";
 pub(crate) const NEW_LIBRARY: &str = "Start a new library";
 
-pub(crate) fn button(id: &str, label: &str, icon: Option<&str>, wide: bool) -> Node {
-    Node::Button {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        icon: icon.map(str::to_owned),
-        wide,
-    }
-}
+/// The padding of a panel.
+pub(crate) const PANEL_PAD: f32 = 12.0;
 
-pub(crate) fn icon_button(id: &str, icon: &str, tip: &str) -> Node {
-    Node::IconButton {
-        id: id.to_owned(),
-        icon: icon.to_owned(),
-        tip: tip.to_owned(),
-    }
+/// The height of the timeline with ramps and without.
+const TIMELINE_PX: f32 = 152.0;
+const PLAIN_PX: f32 = 64.0;
+
+/// The labeled ramp heights.
+const RAMP_MARKS: [(f32, &str); 3] = [(0.0, "stop"), (0.5, "even"), (1.0, "fastest")];
+
+pub(crate) fn button(id: &str, label: &str, icon: &str) -> Button {
+    Button::new(id, label).icon(icon)
 }
 
 pub(crate) fn number_node(id: &str, label: &str, value: Option<f32>) -> Node {
-    Node::Number {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        value: value.map(f64::from),
-    }
+    Number::new(id, label, value.map(f64::from)).into()
 }
 
 pub(crate) fn speed_slider(
@@ -77,122 +67,97 @@ pub(crate) fn speed_slider(
     (min, max, _): (f32, f32, f32),
     value: f32,
 ) -> Node {
-    Node::Slider {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        min: f64::from(min),
-        max: f64::from(max),
-        value: Some(f64::from(value)),
-        log: true,
-        live: false,
-    }
+    Slider::new(
+        id,
+        label,
+        (f64::from(min), f64::from(max)),
+        Some(f64::from(value)),
+    )
+    .log(true)
+    .into()
 }
 
-/// The monotone cubic (Fritsch–Carlson) through `xs` (rising) and `ys`:
-/// no overshoot between points, each extreme level.
-pub(crate) fn monotone(xs: Vec<f32>, ys: Vec<f32>) -> impl Fn(f32) -> f32 {
-    let n = xs.len();
-    let h: Vec<f32> = xs.windows(2).map(|w| w[1] - w[0]).collect();
-    let d: Vec<f32> = (0..n - 1).map(|i| (ys[i + 1] - ys[i]) / h[i]).collect();
-    let mut m = vec![0.0; n];
-    for i in 1..n - 1 {
-        if d[i - 1] * d[i] > 0.0 {
-            let (w1, w2) = (2.0 * h[i] + h[i - 1], h[i] + 2.0 * h[i - 1]);
-            m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+/// The timeline: each key at its time and the height of its ramp, the curve
+/// through them, and the playhead. A key can be dragged in time between its
+/// neighbors and in height; the start only in height. Past [`RAMP_STEPS_MAX`]
+/// steps it shows no ramps.
+pub(crate) fn timeline(
+    steps: &[Step],
+    keys: usize,
+    closed: bool,
+    selected: Option<usize>,
+    playhead: Option<f32>,
+) -> Plot {
+    let times = match keys {
+        0 => Vec::new(),
+        _ => key_times(steps),
+    };
+    let ramped = steps.len() <= RAMP_STEPS_MAX;
+    let at: Vec<[f32; 2]> = times
+        .iter()
+        .enumerate()
+        .map(|(key, time)| match ramped {
+            true => [*time, height(key_ramp(steps, key))],
+            false => [*time, 0.0],
+        })
+        .collect();
+    let end = times.last().copied().unwrap_or(0.0).max(1.0);
+    let x = Axis::new(0.0, end)
+        .marks(Marks::Round("s".to_owned()))
+        .zoom(true)
+        .grows(true);
+    let names = RAMP_MARKS.iter().map(|(h, n)| (*h, (*n).to_owned()));
+    let y = Axis::new(0.0, 1.0).marks(match ramped {
+        true => Marks::At(names.collect()),
+        false => Marks::None,
+    });
+    let mut plot = Plot::new("timeline", x, y)
+        .scrub(true)
+        .height(Size::Px(if ramped { TIMELINE_PX } else { PLAIN_PX }));
+    if let Some(from) = at.first().filter(|_| ramped) {
+        let pieces = ramps(steps, closed)
+            .iter()
+            .zip(at.windows(2))
+            .map(|(ramp, ends)| {
+                let third = (ends[1][0] - ends[0][0]) / 3.0;
+                let [out, into] = ramp.slopes;
+                match third > 0.0 {
+                    true => Piece::Cubic(
+                        [ends[0][0] + third, ends[0][1] + out * third],
+                        [ends[1][0] - third, ends[1][1] - into * third],
+                        ends[1],
+                    ),
+                    false => Piece::Move(ends[1]),
+                }
+            })
+            .collect();
+        plot = plot.push(Curve::new(*from, pieces, Stroke::new(Ink::Accent, 2.0)));
+    }
+    let drag = |key: usize| {
+        let drag = match ramped {
+            true => Drag::default().along_y(0.0, Some(1.0)).live(true),
+            false => Drag::default(),
+        };
+        match key.checked_sub(1) {
+            Some(before) => drag.along_x(times[before], times.get(key + 1).copied()),
+            None => drag,
         }
-    }
-    if n > 1 {
-        m[0] = d[0] * 0.5;
-        m[n - 1] = d[n - 2] * 0.5;
-    }
-    move |t| {
-        let i = (0..n.saturating_sub(2))
-            .find(|i| t <= xs[i + 1])
-            .unwrap_or(n.saturating_sub(2));
-        if n < 2 {
-            return ys.first().copied().unwrap_or(1.0);
+    };
+    plot.extend(at.iter().enumerate().map(|(key, at)| {
+        let mut point = Point::new(*at)
+            .selected(selected == Some(key))
+            .stem(ramped)
+            .drag(drag(key));
+        if ramped {
+            point = point.label((key + 1).to_string());
         }
-        let s = (t - xs[i]) / h[i];
-        let (s2, s3) = (s * s, s * s * s);
-        (2.0 * s3 - 3.0 * s2 + 1.0) * ys[i]
-            + (s3 - 2.0 * s2 + s) * h[i] * m[i]
-            + (-2.0 * s3 + 3.0 * s2) * ys[i + 1]
-            + (s3 - s2) * h[i] * m[i + 1]
-    }
+        point
+    }))
+    .push(Line::new(playhead, Stroke::new(Ink::Marked, 2.0)))
 }
 
-/// The steps of `steps` that take time, by index: the pace lane's dots, in
-/// order.
-pub(crate) fn timed(steps: &[Step]) -> Vec<usize> {
-    (0..steps.len()).filter(|i| steps[*i][6] > 0.0).collect()
-}
-
-/// The pace lane over `steps`: each timed step's dot, the curve drawn
-/// through 1 at every key and through each dot, and the pace played (two
-/// pieces a step, from 1 at its keys to its dot), faint; none for no
-/// timed step or past [`LANE_STEPS_MAX`] steps.
-pub(crate) fn pace_lane(steps: &[Step]) -> Option<Lane> {
-    let timed = timed(steps);
-    if timed.is_empty() || steps.len() > LANE_STEPS_MAX {
-        return None;
-    }
-    let times = key_times(steps);
-    let per = (LANE_POINTS / timed.len()).clamp(1, LANE_STEP_POINTS);
-    let (mut xs, mut ys, mut dots) = (vec![times[timed[0]]], vec![1.0], Vec::new());
-    for i in &timed {
-        let (from, to) = (times[*i], times[i + 1]);
-        let at = from + dot_place(steps[*i][DOT_AT]) * (to - from);
-        dots.push(LaneDot {
-            at: [at, steps[*i][DOT_PACE]],
-            from,
-            to,
-        });
-        if from > *xs.last().expect("a first point") {
-            xs.push(from);
-            ys.push(1.0);
-        }
-        xs.extend([at, to]);
-        ys.extend([steps[*i][DOT_PACE], 1.0]);
-    }
-    let drawn = monotone(xs, ys);
-    let (mut curve, mut played) = (Vec::new(), Vec::new());
-    for i in &timed {
-        let (s, from, to) = (steps[*i], times[*i], times[i + 1]);
-        let mut us: Vec<f32> = (0..per).map(|j| j as f32 / per as f32).collect();
-        us.push(dot_place(s[DOT_AT]));
-        us.sort_by(f32::total_cmp);
-        for u in us {
-            let t = from + u * (to - from);
-            curve.push([t, drawn(t)]);
-            played.push([t, pace(s[DOT_AT], s[DOT_PACE], u)]);
-        }
-    }
-    let end = times[timed[timed.len() - 1] + 1];
-    curve.push([end, 1.0]);
-    played.push([end, 1.0]);
-    Some(Lane {
-        min: 0.0,
-        max: PACE_RANGE.1 as f32,
-        base: 1.0,
-        label: "1×".to_owned(),
-        curves: vec![
-            LaneCurve {
-                points: curve,
-                faint: false,
-            },
-            LaneCurve {
-                points: played,
-                faint: true,
-            },
-        ],
-        dots,
-    })
-}
-
-/// The steps holding key `key`'s handle into it and out of it on `n`
-/// steps: the step before and the step after; none for the start's way in
-/// or the last key's way out, unless `closed`, where the start and the end
-/// are one key, in by the last step and out by the first.
+/// The steps that hold the handles of key `key`, into it and out of it, in a
+/// path of `n` steps. The start and end of a `closed` path are the same key.
 pub(crate) fn side_steps(n: usize, key: usize, closed: bool) -> (Option<usize>, Option<usize>) {
     match key {
         _ if n == 0 || key > n => (None, None),
@@ -201,7 +166,7 @@ pub(crate) fn side_steps(n: usize, key: usize, closed: bool) -> (Option<usize>, 
     }
 }
 
-/// Key `key`'s handle lengths on `steps`: into it and out of it.
+/// The handle lengths of key `key`, into it and out of it.
 pub(crate) fn key_sides(steps: &[Step], key: usize, closed: bool) -> (Option<f32>, Option<f32>) {
     let (into, out) = side_steps(steps.len(), key, closed);
     (
@@ -210,7 +175,7 @@ pub(crate) fn key_sides(steps: &[Step], key: usize, closed: bool) -> (Option<f32
     )
 }
 
-/// Sets key `key`'s handle lengths on `steps`, the sides given.
+/// Sets the given handle lengths of key `key`.
 pub(crate) fn set_key_sides(
     steps: &mut [Step],
     key: usize,
@@ -228,53 +193,59 @@ pub(crate) fn set_key_sides(
     }
 }
 
-/// The chosen key's shape, over the 3D view: Linear or Smooth (each sets
-/// both its handles), and each handle's length, live as it is dragged;
-/// none without a key that has a side.
-pub(crate) fn key_panel(steps: &[Step], key: Option<usize>, closed: bool) -> Option<Node> {
-    let (into, out) = key_sides(steps, key?, closed);
+/// The path controls of key `key`: straight or smooth, and the length of each
+/// handle.
+pub(crate) fn path_rows(steps: &[Step], key: usize, closed: bool) -> Vec<Node> {
+    let (into, out) = key_sides(steps, key, closed);
     if into.is_none() && out.is_none() {
-        return None;
+        return Vec::new();
     }
     let linear = into.unwrap_or(0.0) == 0.0 && out.unwrap_or(0.0) == 0.0;
-    let slider = |id: &str, label: &str, v: f32| Node::Slider {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        min: 0.0,
-        max: HANDLE_MAX,
-        value: Some(f64::from(v)),
-        log: false,
-        live: true,
+    let slider = |id: &str, label: &str, v: f32| -> Node {
+        Slider::new(id, label, (0.0, HANDLE_MAX), Some(f64::from(v)))
+            .live(true)
+            .into()
     };
-    let mut rows = vec![Node::Buttons {
-        id: "key_shape".to_owned(),
-        options: vec!["Linear".to_owned(), "Smooth".to_owned()],
-        selected: Some(usize::from(!linear)),
-        columns: 2,
-    }];
-    rows.extend(into.map(|v| slider("in_len", "In length", v)));
-    rows.extend(out.map(|v| slider("out_len", "Out length", v)));
-    Some(Node::Column(rows))
+    let shapes = [("Straight", "straight"), ("Smooth", "smooth")];
+    let mut rows: Vec<Node> = vec![
+        Text::heading("Path through this key").into(),
+        Button::grid("key_shape", shapes, Some(usize::from(!linear)), 2).into(),
+    ];
+    rows.extend(into.map(|v| slider("in_len", "Curve arriving", v)));
+    rows.extend(out.map(|v| slider("out_len", "Curve leaving", v)));
+    rows
 }
 
 pub(crate) fn track_full() -> String {
     format!("A track holds at most {PATH_MAX} steps.")
 }
 
-pub(crate) fn text(t: impl Into<String>) -> Node {
-    Node::Text(t.into())
+pub(crate) fn name_field(id: &str, label: &str, value: &str) -> Input {
+    Input::new(id, label, value).width(Size::Fill)
 }
 
-pub(crate) fn heading(t: &str) -> Node {
-    Node::Heading(t.to_owned())
+/// A column of rows.
+pub(crate) fn column(rows: Vec<Node>) -> Flow {
+    Flow::col(rows)
 }
 
-pub(crate) fn name_field(id: &str, label: &str, value: &str, live: bool) -> Node {
-    Node::TextInput {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        value: value.to_owned(),
-        live,
-        secret: false,
-    }
+/// A side panel of the editor.
+pub(crate) fn panel(parts: Flow, width: f32) -> Frame {
+    Frame::new(parts.gap(0.0).height(Size::Fill))
+        .surface(Surface::Inset)
+        .width(Size::Px(width))
+        .height(Size::Fill)
+}
+
+/// The scrolling part of a panel, which takes the remaining height.
+pub(crate) fn scrolled(rows: Vec<Node>) -> Frame {
+    Frame::new(column(rows))
+        .scroll(Scroll::Down)
+        .padding(PANEL_PAD)
+        .height(Size::Fill)
+}
+
+/// A part of a panel that doesn't scroll.
+pub(crate) fn pinned(part: impl Into<Node>) -> Frame {
+    Frame::new(part).padding(PANEL_PAD)
 }

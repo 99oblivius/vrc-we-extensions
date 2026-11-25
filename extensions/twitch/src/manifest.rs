@@ -30,7 +30,7 @@ pub(crate) fn build() -> Manifest {
                     Shape::Bool,
                     "True while signed in and hearing your channel",
                 ),
-                field("user", text(64), "Your own Twitch login, once you sign in"),
+                field("user", text(64), "Your own login, once you sign in"),
                 field("event", text(64), "Latest event's type, like channel.cheer"),
                 field(
                     "user_name",
@@ -48,11 +48,7 @@ pub(crate) fn build() -> Manifest {
                     "Title of the reward the latest event redeemed",
                 ),
                 field("input", text(1_024), "What the viewer typed when redeeming"),
-                field(
-                    "error",
-                    text(1_024),
-                    "The latest Twitch problem, empty when none",
-                ),
+                field("error", text(1_024), "The latest problem, empty when none"),
                 field(
                     "bits",
                     number.clone(),
@@ -392,6 +388,6 @@ fn signal_label(signal: &str) -> &'static str {
         "went_offline" => "The stream went offline",
         "polled" => "A poll",
         "poll_ended" => "A poll ended",
-        _ => "A Twitch event",
+        _ => "An event",
     }
 }

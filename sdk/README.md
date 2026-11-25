@@ -49,7 +49,7 @@ Every count and size has a constant in this crate, and the client enforces it:
 
 | Constant | Value | Bounds |
 |---|---|---|
-| `BOUNDARY_VERSION` | 7 | the boundary this SDK speaks |
+| `BOUNDARY_VERSION` | 8 | the boundary this SDK speaks |
 | `TEXT_MAX` / `LIST_MAX` / `VALUES_MAX` | 4 KiB / 1024 / 16384 | a value, a list, one call's values |
 | `FIELDS_MAX` / `METHODS_MAX` / `SIGNALS_MAX` / `PARAMS_MAX` | 256 / 256 / 64 / 16 | a namespace |
 | `SUMMARY_MAX` | 50 characters | a field's or a method's summary |
@@ -66,9 +66,41 @@ The client's sandbox adds what a module cannot lift: a memory cap, fuel slices b
 
 ## Versioning
 
-`BOUNDARY_VERSION` rises when a change could break a module built earlier, such as a removed field or a changed meaning. A manifest field raises it too, since an older client would store the manifest without it and refuse its own record once updated. Other new fields carry `#[serde(default)]` and leave it alone. A module built at any boundary from `MIN_BOUNDARY` up still loads.
+`BOUNDARY_VERSION` rises when a change could break a module built earlier, such as a removed field or a changed meaning. A manifest field raises it too, since an older client would store the manifest without it and refuse its own record once updated. Other new fields carry `#[serde(default)]` and leave it alone. A module built at `MIN_BOUNDARY` (8) or later still loads.
 
 A repository's index states the oldest boundary it needs (`min_boundary`). The client refuses an extension newer than it can run, naming both.
+
+## Views
+
+A view is a tree of `Node`s. Each part is a struct with a `new` function and chainable setters, and converts into a `Node`:
+
+```rust
+use vrc_we_sdk::{col, row, Button, Frame, Scroll, Size, Surface, Text};
+
+let side = Frame::new(col![Text::heading("Tracks"), "None yet."])
+    .surface(Surface::Inset)
+    .scroll(Scroll::Down)
+    .width(Size::Px(224.0))
+    .height(Size::Fill);
+let view = col![
+    row![side, Button::new("play", "Play").icon("play").primary().wide()].height(Size::Fill),
+    Button::grid("mode", [("Photo", "photo"), ("Stream", "stream")], Some(0), 2),
+]
+.height(Size::Fill);
+```
+
+| Parts | Purpose |
+|---|---|
+| `Flow` (`row!`, `col!`), `Grid`, `Layers`, `Frame`, `Divider` | layout: rows and columns, grids, stacks, containers with padding, a background, scrolling or key bindings, and separators |
+| `Text`, `Glyph`, `Status` | text, icons, status lines |
+| `Button` | actions, chosen by its `Act`: press, choose one of several, hold, delete, copy, open a link |
+| `Input`, `Number`, `Slider`, `Toggle`, `Choice` | input |
+| `Plot` | 2D plots: curves, draggable points and lines, with axis marks, zoom and scrubbing |
+| `Scene` | 3D scenes: paths, points and cameras |
+
+Extensions choose roles (`Ink`, `Surface`, `ButtonKind`), and the client's theme decides how they look. A view fills its modal or window if its root has a `Fill` or `Share` height, and scrolls otherwise. `Command::Mark` moves a scene's camera or a plot's line without resending the view, at up to the tick rate.
+
+Every part is `#[non_exhaustive]` and fields added later have defaults, so existing modules keep compiling and running.
 
 ## Files
 
@@ -76,7 +108,7 @@ A repository's index states the oldest boundary it needs (`min_boundary`). The c
 |---|---|
 | `value.rs` | `Value`, `Type`, `Shape`, `Range`: what a field, a parameter or a result carries, and the limits a shape is held to |
 | `manifest.rs` | `Manifest` and everything it declares: namespace, signal, field, method, param, action, condition, page, icon, contact |
-| `node.rs` | the view tree (`Node`, `Mark`, `Key`, `Lane`) and the events widgets send back (`UiEvent`) |
+| `node.rs` | the view tree (`Node` and its parts, `Mark`, `Key`) and the events widgets send back (`UiEvent`) |
 | `osc.rs` | one OSC message in and out |
 | `log.rs` | the game-log prefixes an extension may read |
 | `event.rs` | what the client sends a module |

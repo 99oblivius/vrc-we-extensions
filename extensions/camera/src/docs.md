@@ -1,5 +1,5 @@
 `@CAMERA` drives VRChat's camera: where it is, how it moves, its
-settings, and the tracks and positions saved in the camera's editor.
+settings, and the tracks and positions saved in the advanced camera.
 
 ## Where it is
 
@@ -62,7 +62,7 @@ Contacts read only the camera's place and mode.
 
 ## Tracks and positions
 
-Tracks and positions are made and named in the camera's editor.
+Tracks and positions are made and named in the advanced camera.
 `fly_to(pose, seconds)` flies to a position over seconds, and
 `fly_path(steps)` plays a track. `position(name)` and `track(name)` give
 a saved one by its name, `none` when there is none.
@@ -83,19 +83,22 @@ on @CAMERA.play_ended {
 }
 ```
 
-`add_key()` adds the camera's place to the track chosen in the editor.
+`add_key()` adds the camera's place to the track selected in the advanced
+camera.
 
 A position is a list of six numbers: x, y, z, pitch, yaw and roll. A
 track is a list of steps, each a list of eleven numbers: the move right,
 up and forward from the step before, the change of pitch, yaw and roll,
 the seconds it takes (0 jumps), then its curve: the handle lengths where
-it leaves and where it arrives (0 straight, 1 smooth), and where along
-the step (0 to 1) and how fast there, as a multiple of its average pace.
+it leaves and where it arrives (0 straight, 1 smooth), and the ramps at
+both: -100 stops there, 0 is an even pace, 100 the fastest. The ramps never
+change how long a step takes. The speed changes gradually from one step to
+the next.
 
 ```
 set square to [
-    [1, 0, 0, 0, 90, 0, 1, 0, 0, 0.5, 1],
-    [1, 0, 0, 0, 90, 0, 1, 0, 0, 0.5, 1]
+    [1, 0, 0, 0, 90, 0, 1, 0, 0, 0, 0],
+    [1, 0, 0, 0, 90, 0, 1, 0, 0, 0, 0]
 ]
 run @CAMERA.fly_path(square)
 ```

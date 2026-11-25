@@ -52,11 +52,11 @@ pub trait Extension {
 /// earlier would not read bumps it. So does a manifest field: an older client
 /// would store the manifest without it, then refuse its own record once
 /// updated, since a load compares the two.
-pub const BOUNDARY_VERSION: u32 = 7;
+pub const BOUNDARY_VERSION: u32 = 8;
 
 /// The oldest boundary version the client loads. It rises only to drop
 /// support.
-pub const MIN_BOUNDARY: u32 = 1;
+pub const MIN_BOUNDARY: u32 = 8;
 
 /// Makes `$ext` (an [`Extension`] and `Default`) the module's extension
 /// when built for `wasm32`: writes the exports the client calls.
@@ -798,126 +798,134 @@ mod tests {
         assert_eq!(m.validate(), Err(ManifestError::TooManyIcons));
     }
 
-    #[test]
-    fn a_mark_moves_its_own_kind_on_its_own_id_only() {
-        let camera = [[1.0, 2.0, 3.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
-        let mut view = Node::Split {
-            main: Box::new(Node::Column(vec![
-                Node::Scene3d {
-                    id: "s".into(),
-                    path: Vec::new(),
-                    keys: Vec::new(),
-                    selected: None,
-                    camera: None,
-                    overlay: None,
-                    closed: false,
-                    hint: None,
-                },
-                Node::Timeline {
-                    id: "t".into(),
-                    keys: vec![0.0],
-                    length: 1.0,
-                    selected: None,
-                    playhead: None,
-                    lane: None,
-                },
-            ])),
-            side: Box::new(Node::Divider),
-        };
-        let before = view.clone();
-        assert!(!view.mark("s", &Mark::Playhead(Some(1.0))), "another kind");
-        assert!(!view.mark("x", &Mark::Camera(Some(camera))), "another id");
-        assert_eq!(view, before);
-        assert!(view.mark("s", &Mark::Camera(Some(camera))));
-        assert!(!view.mark("s", &Mark::Camera(Some(camera))), "no change");
-        assert!(view.mark("t", &Mark::Playhead(Some(0.5))));
-        let Node::Split { main, .. } = &view else {
-            unreachable!()
-        };
-        assert!(matches!(
-            main.as_ref(),
-            Node::Column(n) if matches!(n[0], Node::Scene3d { camera: Some(c), .. } if c == camera)
-                && matches!(n[1], Node::Timeline { playhead: Some(0.5), .. })
-        ));
-        assert!(!Mark::Playhead(Some(f32::NAN)).finite());
-        assert!(!Mark::Camera(Some([[f32::INFINITY; 3]; 3])).finite());
-        assert!(Mark::Camera(None).finite());
+    /// A view with a scene "s" and a plot "t", each inside other parts.
+    fn drawn() -> Node {
+        let scene = Scene::new("s")
+            .paths(vec![Path3::new(
+                vec![[0.0; 3]; 2],
+                Stroke::new(Ink::Accent, 2.0),
+            )])
+            .points(vec![Point3::new([0.0; 3]).label("1")])
+            .cameras(vec![[[0.0; 3], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]]);
+        let plot = Plot::new(
+            "t",
+            Axis::new(0.0, 4.0).marks(Marks::Round("s".into())),
+            Axis::new(0.0, 1.0).marks(Marks::At(vec![(0.5, "even".into())])),
+        )
+        .push(Curve::new(
+            [0.0; 2],
+            vec![Piece::Cubic([1.0, 0.0], [2.0, 1.0], [4.0, 1.0])],
+            Stroke::new(Ink::Accent, 2.0),
+        ))
+        .push(Point::new([0.0; 2]).drag(Drag::default().along_y(0.0, Some(1.0))))
+        .push(Line::new(None, Stroke::new(Ink::Marked, 2.0)));
+        row![
+            Frame::new(col![scene, Text::heading("a")])
+                .surface(Surface::Inset)
+                .scroll(Scroll::Down),
+            Node::Layers(vec![plot.into(), "over".into()]),
+        ]
+        .into()
     }
 
     #[test]
-    fn the_editor_nodes_fit_only_finite_and_within_the_limits() {
-        let hinted = |path: Vec<[f32; 3]>, hint: usize| Node::Scene3d {
-            id: "s".into(),
-            path,
-            keys: vec![0],
-            selected: None,
-            camera: Some([[0.0; 3], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
-            overlay: None,
-            closed: false,
-            hint: Some("x".repeat(hint)),
-        };
-        let scene = |path: Vec<[f32; 3]>| hinted(path, 8);
-        assert!(scene(vec![[0.0; 3]; 10]).fits());
-        assert!(
-            !hinted(vec![[0.0; 3]], TEXT_MAX + 1).fits(),
-            "a hint is text like any"
+    fn a_mark_moves_its_own_kind_on_its_own_id_only() {
+        let camera = [[1.0, 2.0, 3.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
+        let mut view = drawn();
+        let before = view.clone();
+        assert!(!view.mark("s", &Mark::Line(0, Some(1.0))), "another kind");
+        assert!(!view.mark("x", &Mark::Camera(0, camera)), "another id");
+        assert!(!view.mark("s", &Mark::Camera(1, camera)), "another camera");
+        assert!(!view.mark("t", &Mark::Line(1, Some(1.0))), "another line");
+        assert_eq!(view, before);
+        assert!(view.mark("s", &Mark::Camera(0, camera)));
+        assert!(!view.mark("s", &Mark::Camera(0, camera)), "no change");
+        assert!(view.mark("t", &Mark::Line(0, Some(0.5))));
+        let (mut pose, mut line) = (None, None);
+        view.each(&mut |n| match n {
+            Node::Scene(s) => pose = Some(s.cameras[0]),
+            Node::Plot(p) => {
+                line = p.items.iter().find_map(|i| match i {
+                    Drawn::Line(l) => l.at,
+                    _ => None,
+                })
+            }
+            _ => {}
+        });
+        assert_eq!((pose, line), (Some(camera), Some(0.5)));
+        assert!(!Mark::Line(0, Some(f32::NAN)).finite());
+        assert!(!Mark::Camera(0, [[f32::INFINITY; 3]; 3]).finite());
+        assert!(Mark::Line(0, None).finite());
+    }
+
+    #[test]
+    fn a_view_reads_back_as_it_was_and_without_what_it_leaves_as_usual() {
+        let view = drawn();
+        let sent = serde_json::to_string(&view).expect("a view serializes");
+        let back: Node = serde_json::from_str(&sent).expect("a view reads");
+        assert_eq!(back, view);
+        // What a module built before a field was added sends.
+        let bare: Node = serde_json::from_str(
+            r#"{"Flow": {"children": [{"Button": {"id": "go"}}, {"Text": {"text": "a"}}]}}"#,
+        )
+        .expect("a view reads without what it leaves out");
+        assert_eq!(
+            bare,
+            row![Button::new("go", ""), Text::new("a").ink(Ink::Plain)].into()
         );
-        assert!(!scene(vec![[f32::NAN, 0.0, 0.0]]).fits());
-        assert!(!scene(vec![[0.0; 3]; VIEW_NODES_MAX]).fits());
-        let timeline = |length: f32| Node::Timeline {
-            id: "t".into(),
-            keys: vec![0.0, 2.0],
-            length,
-            selected: Some(1),
-            playhead: Some(1.0),
-            lane: None,
-        };
-        assert!(timeline(4.0).fits());
-        assert!(!timeline(f32::INFINITY).fits());
-        let laned = |points: usize, dot: LaneDot| Node::Timeline {
-            id: "t".into(),
-            keys: vec![0.0, 2.0],
-            length: 4.0,
-            selected: None,
-            playhead: None,
-            lane: Some(Lane {
-                min: 0.0,
-                max: 2.0,
-                base: 1.0,
-                label: "1×".into(),
-                curves: vec![LaneCurve {
-                    points: vec![[0.0, 1.0]; points],
-                    faint: false,
-                }],
-                dots: vec![dot],
-            }),
-        };
-        let dot = |at: [f32; 2], from: f32, to: f32| LaneDot { at, from, to };
-        assert!(laned(10, dot([1.0, 1.5], 0.0, 2.0)).fits());
-        assert!(!laned(10, dot([f32::NAN, 1.5], 0.0, 2.0)).fits());
-        assert!(
-            !laned(10, dot([1.0, 1.5], 2.0, 0.0)).fits(),
-            "a dot's span is ordered"
+    }
+
+    #[test]
+    fn a_views_numbers_are_finite_ordered_and_within_the_limits() {
+        assert!(drawn().fits());
+        let axis = || Axis::new(0.0, 1.0);
+        let plot = |item: Drawn| Plot::new("t", axis(), axis()).push(item);
+        let stroke = Stroke::new(Ink::Plain, 1.0);
+        let fits = |part: Node| part.fits();
+        let nan = f32::NAN;
+        assert!(!fits(Plot::new("t", Axis::new(1.0, 1.0), axis()).into()));
+        assert!(!fits(
+            Plot::new(
+                "t",
+                axis(),
+                axis().marks(Marks::At(vec![(nan, "a".into())]))
+            )
+            .into()
+        ));
+        for bad in [
+            Drawn::Point(Point::new([nan, 0.0])),
+            Drawn::Point(Point::new([0.0; 2]).drag(Drag::default().along_x(1.0, Some(0.0)))),
+            Drawn::Curve(Curve::new([0.0; 2], vec![Piece::Line([0.0, nan])], stroke)),
+            Drawn::Curve(Curve::new(
+                [0.0; 2],
+                vec![Piece::Cubic([0.0; 2], [nan, 0.0], [1.0; 2])],
+                stroke,
+            )),
+            Drawn::Line(Line::new(Some(nan), stroke)),
+            Drawn::Line(Line::new(None, Stroke::new(Ink::Plain, nan))),
+        ] {
+            assert!(!fits(plot(bad.clone()).into()), "{bad:?}");
+        }
+        let long = Curve::new(
+            [0.0; 2],
+            vec![Piece::Line([1.0; 2]); VIEW_NODES_MAX],
+            stroke,
         );
-        assert!(
-            !laned(VIEW_NODES_MAX, dot([1.0, 1.5], 0.0, 2.0)).fits(),
-            "a lane's points count as nodes"
-        );
-        let overlaid = |text: usize| Node::Scene3d {
-            id: "s".into(),
-            path: vec![[0.0; 3]; 2],
-            keys: vec![0],
-            selected: None,
-            camera: None,
-            overlay: Some(Box::new(Node::Text("x".repeat(text)))),
-            closed: false,
-            hint: None,
-        };
-        assert!(overlaid(8).fits());
-        assert!(
-            !overlaid(TEXT_MAX + 1).fits(),
-            "a scene's overlay is checked too"
-        );
+        assert!(!fits(plot(long.into()).into()), "a piece counts as a node");
+        let scene = |points: Vec<[f32; 3]>| Scene::new("s").paths(vec![Path3::new(points, stroke)]);
+        assert!(!fits(scene(vec![[nan, 0.0, 0.0]]).into()));
+        assert!(!fits(scene(vec![[0.0; 3]; VIEW_NODES_MAX]).into()));
+        assert!(!fits(
+            scene(Vec::new()).hint("x".repeat(TEXT_MAX + 1)).into()
+        ));
+        for bad in [nan, -1.0, PX_MAX + 1.0] {
+            assert!(!fits(Frame::new("a").padding(bad).into()), "{bad}");
+            assert!(!fits(Frame::new("a").width(Size::Px(bad)).into()), "{bad}");
+            assert!(!fits(row!["a"].gap(bad).into()), "{bad}");
+        }
+        assert!(!fits(
+            Frame::new(Node::Layers(vec!["x".repeat(TEXT_MAX + 1).into()])).into()
+        ));
         let dragged = |at: f64| UiEvent::Dragged {
             id: "t".into(),
             index: 0,
@@ -927,48 +935,19 @@ mod tests {
         };
         assert!(dragged(1.0).fits());
         assert!(!dragged(f64::INFINITY).fits());
-        let split = Node::Split {
-            main: Box::new(timeline(4.0)),
-            side: Box::new(Node::Text("x".repeat(TEXT_MAX + 1))),
-        };
-        assert!(!split.fits(), "a split's sides are checked too");
-        assert!(UiEvent::Moved {
-            id: "t".into(),
-            index: 0,
-            value: 2.0
-        }
-        .fits());
-        assert!(!UiEvent::Moved {
-            id: "t".into(),
-            index: 0,
-            value: f64::NAN
-        }
-        .fits());
     }
 
     #[test]
     fn a_slider_needs_an_ordered_range_above_0_by_ratio_and_a_hold_key_a_bindable_one() {
-        let slider = |min: f64, max: f64, log: bool| Node::Slider {
-            id: "speed".into(),
-            label: "Speed".into(),
-            min,
-            max,
-            value: Some(1.0),
-            log,
-            live: false,
+        let slider = |min: f64, max: f64, log: bool| {
+            Node::from(Slider::new("speed", "Speed", (min, max), Some(1.0)).log(log)).fits()
         };
-        assert!(slider(0.01, 100.0, true).fits());
-        assert!(slider(-1.0, 1.0, false).fits());
-        assert!(!slider(0.0, 100.0, true).fits(), "a ratio from 0");
-        assert!(!slider(5.0, 5.0, false).fits());
-        assert!(!slider(0.0, f64::INFINITY, false).fits());
-        let hold = |key| Node::HoldButton {
-            id: "forward".into(),
-            icon: "up".into(),
-            tip: "Forward".into(),
-            key: Some(key),
-            disabled: false,
-        };
+        assert!(slider(0.01, 100.0, true));
+        assert!(slider(-1.0, 1.0, false));
+        assert!(!slider(0.0, 100.0, true), "a ratio from 0");
+        assert!(!slider(5.0, 5.0, false));
+        assert!(!slider(0.0, f64::INFINITY, false));
+        let hold = |key| Node::from(Button::hold("forward", "up", "Forward", Some(key))).fits();
         for key in [
             Key::Char('w'),
             Key::Char('7'),
@@ -976,7 +955,7 @@ mod tests {
             Key::Shift,
             Key::Left,
         ] {
-            assert!(hold(key).fits(), "{key:?}");
+            assert!(hold(key), "{key:?}");
         }
         for key in [
             Key::Char('W'),
@@ -984,7 +963,9 @@ mod tests {
             Key::Char(' '),
             Key::Char('\u{1b}'),
         ] {
-            assert!(!hold(key).fits(), "{key:?}");
+            assert!(!hold(key), "{key:?}");
+            let frame = Frame::new("").keys(vec![(key, "forward".to_owned())]);
+            assert!(!Node::from(frame).fits(), "{key:?}");
         }
         assert!(UiEvent::Wheel { lines: -2.5 }.fits());
         assert!(!UiEvent::Wheel { lines: f64::NAN }.fits());
@@ -1434,35 +1415,27 @@ mod tests {
 
     #[test]
     fn a_view_fits_within_its_nodes_and_depth() {
-        let column = |n: usize| Node::Column(vec![Node::Text("x".into()); n]);
+        let column = |n: usize| Node::from(Flow::col(vec!["x".into(); n]));
         assert!(column(VIEW_NODES_MAX - 1).fits());
         assert!(!column(VIEW_NODES_MAX).fits());
-        let list = Node::List {
-            id: "l".into(),
-            items: vec!["row".into(); VIEW_NODES_MAX],
-            selected: None,
-        };
-        assert!(!list.fits(), "a list's rows count as nodes");
-        let nest =
-            |depth: usize| (1..depth).fold(Node::Text("x".into()), |n, _| Node::Row(vec![n]));
+        let choice: Node = Choice::new("l", vec!["row".into(); VIEW_NODES_MAX], None).into();
+        assert!(!choice.fits(), "a choice's options count as nodes");
+        let nest = |depth: usize| (1..depth).fold(Node::from("x"), |n, _| row![n].into());
         assert!(nest(VIEW_DEPTH_MAX).fits());
         assert!(!nest(VIEW_DEPTH_MAX + 1).fits());
     }
 
     #[test]
     fn a_views_text_is_held_per_string_and_in_all() {
-        let text = |n: usize| Node::Text("x".repeat(n));
+        let text = |n: usize| Node::from("x".repeat(n));
         assert!(text(TEXT_MAX).fits());
         assert!(!text(TEXT_MAX + 1).fits());
-        let column = |n: usize| Node::Column(vec![text(TEXT_MAX); n]);
+        let column = |n: usize| Node::from(Flow::col(vec![text(TEXT_MAX); n]));
         assert!(column(VIEW_TEXT_MAX / TEXT_MAX).fits());
         assert!(!column(VIEW_TEXT_MAX / TEXT_MAX + 1).fits());
-        let copy = |n: usize| Node::Copy {
-            label: "Copy".into(),
-            text: "x".repeat(n),
-        };
+        let copy = |n: usize| Node::from(Button::copy("Copy", "x".repeat(n)));
         assert!(copy(VIEW_COPY_MAX).fits(), "a copy text isn't shown");
-        assert!(!Node::Column(vec![copy(VIEW_COPY_MAX), copy(1)]).fits());
+        assert!(!Node::from(col![copy(VIEW_COPY_MAX), copy(1)]).fits());
     }
 
     #[test]

@@ -1,26 +1,21 @@
 //! VRChat's user camera (`/usercamera/*`) as `@CAMERA`.
 //!
-//! `Pose` carries x y z, then pitch yaw roll in degrees; the rotation is
-//! the Z, X, Y extrinsic euler order (roll, then pitch, then yaw).
-//! `move_local` and `turn_local` act in the camera's own frame (forward is
-//! its view), `move_world` and `turn_world` on the world's axes; a turn's
-//! angles compose in the same euler order.
+//! `Pose` carries x, y, z, then pitch, yaw and roll in degrees. The rotation is
+//! extrinsic: roll, then pitch, then yaw. `move_local` and `turn_local` are
+//! relative to the camera, `move_world` and `turn_world` to the world's axes.
 //!
-//! A path (`fly_path`, a track) is a list of steps, each a move and a turn
-//! from the point before (a relative program, like G91): the move on the
-//! heading of the pose it started from (its yaw alone), along a cubic
-//! Bezier through the keys, the turn as the change of pitch, yaw and roll,
-//! each in a line, and both at the step's pace (`motion::Curve`). Plays
-//! stack: every step of the clock, each adds how far its own path moved
-//! since the last to wherever the camera is, so
-//! moves, writes, the person's own movement, held pads and other plays all
-//! add up. One `Pose` goes out per step.
+//! A path (`fly_path`, a track) is a list of steps, each relative to the
+//! previous point: a move along a Bézier curve, relative to the heading of the
+//! start, a change of pitch, yaw and roll, and the ramps that set its pace
+//! (`motion::Curve`). Plays are cumulative: on each tick every play adds its
+//! change to the camera's pose, along with the user's own movement, held pads
+//! and other plays. One `Pose` is sent per tick.
 //!
-//! The library keeps named tracks and named positions in the extension's
-//! store: `library` lists them, and each track's steps are under its own
-//! key. Actions pick them by key; their data goes out when one fires or
-//! travels (`Event::Resolve`), and an arriving mapping's item is kept here,
-//! reusing an identical one (`Event::Import`).
+//! The library is kept in the extension's store: `library` lists the tracks and
+//! positions, and each track's steps have a key of their own. Actions pick an
+//! item by key. Its data is sent when the action fires or is shared
+//! (`Event::Resolve`), and added to the library of the client that receives it
+//! (`Event::Import`).
 
 use glam::Vec3;
 use vrc_we_sdk::{
@@ -39,7 +34,7 @@ use motion::{
     continuing, euler, pose_of, position, rotation, step_of, Fly, Follow, Optics, Play, Resume,
     Step, MOVE_SPEED, SMOOTH, SMOOTH_SECONDS, TURN_SPEED, WIRE,
 };
-use view::EDITOR;
+use view::{Tab, EDITOR};
 
 vrc_we_sdk::export!(Camera);
 
@@ -54,7 +49,7 @@ pub(crate) const CLOSE: &str = "/usercamera/Close";
 pub(crate) const POSE_FIELDS: [&str; 6] = ["x", "y", "z", "pitch", "yaw", "roll"];
 
 pub(crate) const PAGE: &str = "camera";
-/// The signal a play that runs to its end sends; a stopped one doesn't.
+/// The signal sent when a play runs to its end. A stopped play doesn't send it.
 pub(crate) const PLAY_ENDED: &str = "play_ended";
 
 /// VRChat's camera modes, by `Mode` value.
@@ -68,12 +63,13 @@ pub(crate) const MODES: [&str; 7] = [
     "Drone",
 ];
 
-/// VRChat's camera sliders (2025.3.3): field, OSC name, label, range, the
-/// default those notes give, and the field's summary. VRChat sends no update
-/// when one moves: the client reads its value from VRChat's OSCQuery tree
-/// when this starts, and until then a slider reads its default. The notes
-/// give Lightness 0–50 with a default of 60; it takes 0–100 and 50 until
-/// VRChat's own range is checked.
+/// VRChat's camera sliders (2025.3.3): field, OSC name, label, minimum,
+/// maximum, default and summary.
+///
+/// The ranges and defaults are those of VRChat's release notes. They give
+/// Lightness a range of 0–50 with a default of 60, so 0–100 and 50 are used
+/// instead. VRChat sends no update when a slider is moved: the client reads the
+/// values from OSCQuery at start, and a slider reads its default until then.
 pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64, &str); 14] = [
     (
         "zoom",
@@ -203,20 +199,17 @@ pub(crate) const SLIDERS: [(&str, &str, &str, f64, f64, f64, &str); 14] = [
     ),
 ];
 
-/// The sliders a key holds ([`motion::Optics`]), in a step's order.
+/// The sliders a key stores ([`motion::Optics`]), in a step's order.
 pub(crate) const OPTIC_FIELDS: [&str; 4] = ["zoom", "focal_distance", "aperture", "exposure"];
 
-/// The toggle that smooths the camera's movement, and its strength's
-/// slider.
+/// The toggle that smooths the camera's movement, and the slider for its
+/// strength.
 pub(crate) const SMOOTH_MOVEMENT: &str = "smooth_movement";
 pub(crate) const SMOOTHING_STRENGTH: &str = "smoothing_strength";
 
-/// VRChat's camera toggles (2025.3.3): field, OSC name, label, the value
-/// it reads until VRChat's is known (the client reads it when this
-/// starts) or it is set here, and the field's summary. VRChat documents
-/// no defaults: these are
-/// a fresh camera's as chosen here (every layer shown, landscape, the
-/// rest off).
+/// VRChat's camera toggles (2025.3.3): field, OSC name, label, default and
+/// summary. VRChat documents no defaults; these match a new camera. The client
+/// reads the actual values from OSCQuery at start.
 pub(crate) const TOGGLES: [(&str, &str, &str, bool, &str); 18] = [
     (
         "show_ui_in_camera",
@@ -346,72 +339,62 @@ pub(crate) const TOGGLES: [(&str, &str, &str, bool, &str); 18] = [
     ),
 ];
 
-/// The play clock: one step of every play, held pad and look, and one
-/// `Pose`, each tick of the client's.
+/// The timer of the play clock: one tick of every play, held pad and look.
 pub(crate) const PLAY: &str = "play";
 
-/// VRChat reports the camera's pose as it follows the poses sent to it,
-/// late, so a report taken while this drives it would undo the latest
-/// steps: reports wait until this has sent nothing for `SETTLE_MS`, and
-/// the last one is then taken as where VRChat put the camera.
+/// VRChat reports the camera's pose with a delay as it follows the poses sent
+/// to it. Reports therefore wait until nothing has been sent for `SETTLE_MS`,
+/// and then the last one is applied.
 pub(crate) const SETTLE: &str = "settle";
 pub(crate) const SETTLE_MS: u32 = 300;
 
-/// The same for the settings this sends (a live drag, a write, a play's
-/// optics): VRChat's reports of one wait until this has sent it nothing
-/// for `SETTLE_MS`, so a late echo never pulls it back.
+/// The same for settings: reports of a setting wait until it hasn't been sent
+/// for `SETTLE_MS`.
 pub(crate) const SETTLE_SETTINGS: &str = "settle_settings";
 
-/// Sliders go to VRChat at most once a tick, each at its latest value: a
-/// drag reports every mouse move, faster than VRChat takes them, and a
-/// backlog would trail behind the drag.
+/// Sliders are sent at most once per tick, with their latest value, since a
+/// drag reports every movement of the mouse.
 pub(crate) const SEND_SETTINGS: &str = "send_settings";
 
-/// While the clock runs, one stream goes to VRChat, one message a tick: the
-/// pose, but for one tick in this many (12 a second) that carries the
-/// settings changed meanwhile instead, the next tick's pose catching up. A
-/// pose stream beside a settings stream stepped the motion and the
-/// person's own input in game; VRChat documents no limit, so the rate is
-/// chosen, not measured.
+/// While the clock runs, one message is sent per tick: the pose, except every
+/// this many ticks, when changed settings are sent instead. Sending settings
+/// next to the poses makes the motion uneven in VRChat. VRChat documents no
+/// limit, so the rate is a choice.
 pub(crate) const SETTINGS_TICKS: u32 = 5;
 
-/// With no clock running, the optics ([`OPTIC_FIELDS`]) rest this many
-/// ticks after a send (30 a second), [`REST`] ending it: VRChat takes the
-/// zoom more slowly than 60 a second, and a faster stream queues.
+/// While the clock doesn't run, the ticks between two sends of the optics
+/// ([`OPTIC_FIELDS`]): VRChat can't keep up with 60 zoom changes per second.
+/// [`REST`] is the timer for it.
 pub(crate) const REST_TICKS: u32 = 2;
 pub(crate) const REST: &str = "rest";
 
-/// One of VRChat's camera settings, by its place in [`SLIDERS`] or
-/// [`TOGGLES`].
+/// A camera setting, by its index in [`SLIDERS`] or [`TOGGLES`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Setting {
     Slider(usize),
     Toggle(usize),
 }
 
-/// While the clock runs, the editor's view is built anew once in this many
-/// motion events (a tick, a report, a look), so its offset line and
-/// settings follow, and once more when the clock stops; between, only its
-/// camera and playhead move (`Command::Mark`). A whole view each tick would
-/// spend a long track's fuel.
+/// While the clock runs, the editor's view is rebuilt once in this many motion
+/// events. In between, only its camera and playhead move (`Command::Mark`),
+/// since rebuilding a long track's view on each tick takes too much fuel.
 pub(crate) const EDITOR_REFRESH: u32 = 15;
 
-/// A live edit (a slider moving) is kept once no other has come for
-/// `SAVE_MS`.
+/// The timer that stores a live edit, such as a slider being moved, once there
+/// has been no other for `SAVE_MS`.
 pub(crate) const SAVE: &str = "save";
 pub(crate) const SAVE_MS: u32 = 400;
 
 pub(crate) const LIBRARY_KEY: &str = "library";
 
-/// The lists actions pick from: tracks by name (their steps), positions by
-/// name (their poses).
+/// The lists actions pick from: tracks and positions.
 pub(crate) const TRACKS: &str = "tracks";
 pub(crate) const POSITIONS: &str = "positions";
 
-/// The longest name a track or a position takes, in characters.
+/// The longest name of a track or a position, in characters.
 pub(crate) const NAME_MAX: usize = 64;
 
-pub(crate) const NAME_TAKEN: &str = "Give it a name nothing else here has.";
+pub(crate) const NAME_TAKEN: &str = "That name is taken or empty.";
 pub(crate) const OPEN_FIRST: &str = "Open the camera in VRChat first.";
 pub(crate) const MOVE_FIRST: &str =
     "Move the camera in VRChat once: VRChat tells where it is only as it moves.";
@@ -441,7 +424,8 @@ fn arg_bool(arg: &OscArg) -> Option<bool> {
     }
 }
 
-/// A path as a script passes it, once checked against its shape.
+/// Reads a path passed by a script, which the client has checked against its
+/// shape.
 pub(crate) fn steps_of(value: &Value) -> Vec<Step> {
     let Value::List(items) = value else {
         return Vec::new();
@@ -455,7 +439,7 @@ pub(crate) fn steps_of(value: &Value) -> Vec<Step> {
         .collect()
 }
 
-/// A pose as a script or an action passes it.
+/// Reads a pose passed by a script or an action.
 pub(crate) fn pose_value(value: &Value) -> Option<[f32; 6]> {
     let Value::List(v) = value else { return None };
     <[f32; 6]>::try_from(v.iter().map(number).collect::<Vec<_>>()).ok()
@@ -465,7 +449,7 @@ pub(crate) fn pose_list(pose: &[f32; 6]) -> Value {
     Value::List(pose.iter().map(|n| Value::Number(f64::from(*n))).collect())
 }
 
-/// `steps` as they cross: each its first [`WIRE`] numbers.
+/// `steps` as a value: the first [`WIRE`] numbers of each.
 pub(crate) fn steps_value(steps: &[Step]) -> Value {
     Value::List(
         steps
@@ -482,10 +466,8 @@ pub(crate) fn steps_value(steps: &[Step]) -> Value {
     )
 }
 
-/// `v` as Wex reads it, onto `into`: at most four decimals, no trailing
-/// zeros. Written digit by digit: a float formatted to a precision takes an
-/// exact path, and each formatted piece an allocation, that interpreted
-/// spend a long track's view's fuel.
+/// Appends `v` in Wex notation, with at most four decimals. Written by hand
+/// because formatting floats takes too much fuel for a long track.
 fn push_number(into: &mut String, v: f32) {
     let n = (f64::from(v) * 10_000.0).round() as i64;
     if n < 0 {
@@ -516,15 +498,14 @@ fn push_number(into: &mut String, v: f32) {
     }
 }
 
-/// A number as Wex reads it ([`push_number`]).
+/// `v` in Wex notation ([`push_number`]).
 pub(crate) fn wex_number(v: f32) -> String {
     let mut s = String::new();
     push_number(&mut s, v);
     s
 }
 
-/// Steps as the Wex list `fly_path` takes, one step a line, each its first
-/// [`WIRE`] numbers.
+/// Steps as the Wex list that `fly_path` takes, one step per line.
 pub(crate) fn wex(steps: &[Step]) -> String {
     let mut s = String::with_capacity(steps.len() * 64 + 4);
     s.push('[');
@@ -544,22 +525,19 @@ pub(crate) fn wex(steps: &[Step]) -> String {
 
 #[derive(Debug)]
 pub struct Camera {
-    /// The camera's pose: VRChat's while it reports one (`linked`), else a
-    /// stand-in the pads, keys and plays move here, placed at the chosen
-    /// track's start (`placed_for`). Only a linked pose goes to VRChat, and
-    /// the pose fields, scripts' moves and their writes wait for one: a
-    /// pose sent from the stand-in would move VRChat's camera there.
+    /// The camera's pose: VRChat's if it reports one (`linked`), otherwise that
+    /// of a stand-in at the start of the selected track (`placed_for`). The
+    /// stand-in's pose is never sent to VRChat or published.
     pose: [f32; 6],
     linked: bool,
     placed_for: Option<String>,
     /// The pose fields as last published.
     published: Option<[f32; 6]>,
-    /// Where the camera is sent while this smooths it toward the pose
-    /// (`SmoothMovement` on), until it rests there; and whether VRChat's
-    /// own smoothing is switched off meanwhile, to come back on once VRChat
-    /// settles. VRChat's eases each angle within 0–360 and restarts on
-    /// every pose sent, so a turn past 360 swung back and a move cancelled
-    /// a turn's momentum.
+    /// The smoothed pose sent to VRChat while `SmoothMovement` is on, until it
+    /// reaches the camera's pose. `overriding` is set while VRChat's own
+    /// smoothing is switched off in its place: that one works on angles in
+    /// 0–360 and restarts with every pose, so it turns back at 360° and cancels
+    /// momentum.
     follow: Option<Follow>,
     overriding: bool,
     mode: Option<i32>,
@@ -568,65 +546,66 @@ pub struct Camera {
     tracks: Vec<Track>,
     positions: Vec<Position>,
     next_key: u32,
-    /// The track the editor edits, chosen whenever there is one, and its
-    /// key chosen there: 0 its start, `n` the end of its step `n - 1`.
+    /// The selected track, and its selected key: 0 is the start, `n` the end of
+    /// step `n - 1`.
     track: Option<usize>,
     key: Option<usize>,
-    /// The position chosen in the editor.
+    /// The selected position.
     spot: Option<usize>,
-    /// What the track lists show: the names holding it.
+    /// The search text of the track lists.
     search: String,
+    /// The selected tab of the editor.
+    tab: Tab,
     plays: Vec<Play>,
-    /// The pads held down, flying the camera.
+    /// The directions being flown in.
     flying: Vec<Fly>,
-    /// The pads' speeds: metres and degrees a second (not VRChat's own
-    /// fly and turn speeds).
+    /// The flying speeds in metres and degrees per second.
     move_speed: f32,
     turn_speed: f32,
-    /// The pads move on the camera's own axes, not level.
+    /// Whether flying is relative to the camera instead of level.
     local_nav: bool,
-    /// The play clock runs, and when it last stepped (`Event::Timer`'s
-    /// `at_ms`).
+    /// Whether the clock runs, and the time of its last tick (`Event::Timer`).
     ticking: bool,
     last_tick: Option<u64>,
-    /// Pixels a right-drag in the 3D view moved since the last step.
+    /// Pixels looked since the last tick, by dragging with the right button.
     look: [f32; 2],
-    /// Reports wait (`SETTLE`); the last one that arrived meanwhile.
+    /// Whether reports wait (`SETTLE`), and the last one received meanwhile.
     settling: bool,
     reported: Option<[f32; 6]>,
-    /// The settings sent since they last settled, each with VRChat's last
-    /// report of it meanwhile (a toggle's as 0 or 1); and the sliders set
-    /// since the last send ([`SEND_SETTINGS`]).
+    /// The settings sent that haven't settled, each with VRChat's last report
+    /// (a toggle as 0 or 1), and the sliders changed since the last send
+    /// ([`SEND_SETTINGS`]).
     settings_sent: Vec<(Setting, Option<f32>)>,
     sliders_due: Vec<usize>,
-    /// Ticks before the optics may go again with no clock running
-    /// ([`REST_TICKS`]); the clock's place in its round of
-    /// [`SETTINGS_TICKS`]; and the pose it holds for its next send.
+    /// Ticks until the optics can be sent again ([`REST_TICKS`]), the clock's
+    /// position in its cycle of [`SETTINGS_TICKS`], and the pose that the next
+    /// pose tick sends.
     resting: u32,
     beat: u32,
     held_pose: Option<[f32; 6]>,
-    /// Where the person's play of a track goes on from.
+    /// Where playing a track resumes.
     resume: Option<Resume>,
-    /// The handle lengths (out, in) a new key takes: the last chosen key's.
+    /// The handle lengths (out, in) of a new key: those of the last selected
+    /// key.
     key_handles: [f32; 2],
-    /// The track a live edit changed, kept once the edits settle (`SAVE`).
+    /// The key of the track with a live edit to store (`SAVE`).
     unsaved: Option<String>,
-    /// The chosen track's key as the library last kept it.
+    /// The key of the selected track as last stored.
     kept_choice: Option<String>,
     editor_open: bool,
-    /// Motion events since the editor's view was last built, the plays
-    /// running then, and its camera and playhead as last shown.
+    /// Motion events since the editor was rebuilt, the number of plays at the
+    /// time, and its camera and playhead as last shown.
     since_built: u32,
     built_plays: usize,
     marked: ([[f32; 3]; 3], Option<f32>),
-    /// One line for the person about what the last action did.
+    /// A message for the user about the last action.
     note: Option<String>,
     shown: Option<Node>,
     shown_editor: Option<Node>,
-    /// The library changed since its lists were last published.
+    /// The library has changed since its lists were published.
     library_changed: bool,
-    /// A stored library value couldn't be read. Nothing is shown and nothing
-    /// is saved over it until the person starts a new library here.
+    /// A stored value couldn't be read. The library isn't shown or saved until
+    /// the user starts a new one.
     unreadable: bool,
 }
 
@@ -649,6 +628,7 @@ impl Default for Camera {
             key: None,
             spot: None,
             search: String::new(),
+            tab: Tab::default(),
             plays: Vec::new(),
             flying: Vec::new(),
             move_speed: MOVE_SPEED.2,
@@ -682,8 +662,8 @@ impl Default for Camera {
 }
 
 impl Camera {
-    /// Takes `pose` as the camera's, publishing the fields it changes
-    /// while linked.
+    /// Sets the camera's pose and, while linked, publishes the fields that
+    /// changed.
     fn set_pose(&mut self, pose: [f32; 6], out: &mut Vec<Command>) {
         if self.linked {
             for (i, name) in POSE_FIELDS.iter().enumerate() {
@@ -699,9 +679,8 @@ impl Camera {
         self.pose = pose;
     }
 
-    /// Moves the camera to `pose`, its angles going on from the last pose's
-    /// ([`continuing`]): at once, or, while smoothing, by the clock
-    /// ([`Follow`]).
+    /// Moves the camera to `pose`: at once, or over time while smoothing. Its
+    /// angles are continuous ([`continuing`]).
     fn send_pose(&mut self, pose: [f32; 6], out: &mut Vec<Command>) {
         let before = self.pose;
         let pose = continuing(&before, pose);
@@ -715,11 +694,9 @@ impl Camera {
         }
     }
 
-    /// Sends `pose` to VRChat while linked, VRChat's own smoothing switched
-    /// off first while this smooths; its reports wait until it settles
-    /// (`SETTLE`).
-    /// While the clock runs, it goes with the clock's next pose tick
-    /// ([`SETTINGS_TICKS`]).
+    /// Sends `pose` to VRChat if linked: at once, or with the next pose tick
+    /// while the clock runs. VRChat's own smoothing is switched off if this
+    /// smooths instead.
     fn transmit(&mut self, pose: [f32; 6], out: &mut Vec<Command>) {
         if !self.linked {
             return;
@@ -730,7 +707,7 @@ impl Camera {
         }
     }
 
-    /// Sends the pose the clock holds, if any.
+    /// Sends the pose that waits for the next pose tick, if any.
     pub(crate) fn release_pose(&mut self, out: &mut Vec<Command>) {
         if let Some(pose) = self.held_pose.take() {
             self.transmit_now(pose, out);
@@ -754,9 +731,8 @@ impl Camera {
         self.reported = None;
     }
 
-    /// The camera `dt` seconds on toward the pose while smoothing, sent as
-    /// it goes; it rests on the pose once there, or at once when smoothing
-    /// stops.
+    /// Advances smoothing by `dt` seconds. It ends at the pose, or at once when
+    /// smoothing is switched off.
     pub(crate) fn follow_step(&mut self, dt: f32, out: &mut Vec<Command>) {
         let Some(mut f) = self.follow.take() else {
             return;
@@ -775,7 +751,7 @@ impl Camera {
         }
     }
 
-    /// The spring's rate a second while smoothing ([`SMOOTH_SECONDS`]).
+    /// The rate of smoothing per second, if it is on ([`SMOOTH_SECONDS`]).
     pub(crate) fn smooth_rate(&self) -> Option<f32> {
         let strength = SLIDERS
             .iter()
@@ -786,8 +762,7 @@ impl Camera {
             .then(|| 1.0 / (scale * strength.max(0.01).powf(power)))
     }
 
-    /// Moves the camera to `pose` at once, smoothing or not: a jump to a
-    /// key or a track's start.
+    /// Moves the camera to `pose` at once, even while smoothing.
     pub(crate) fn jump_pose(&mut self, pose: [f32; 6], out: &mut Vec<Command>) {
         let pose = continuing(&self.pose, pose);
         self.set_pose(pose, out);
@@ -795,7 +770,7 @@ impl Camera {
         self.transmit(pose, out);
     }
 
-    /// The camera's optics as they stand.
+    /// The camera's current optics.
     pub(crate) fn optics_now(&self) -> Optics {
         OPTIC_FIELDS.map(|f| {
             SLIDERS
@@ -805,7 +780,7 @@ impl Camera {
         })
     }
 
-    /// Sets the camera's optics, sending VRChat those that change.
+    /// Sets the camera's optics, sending those that changed.
     pub(crate) fn set_optics(&mut self, optics: Optics, out: &mut Vec<Command>) {
         for (field, v) in OPTIC_FIELDS.iter().zip(optics) {
             let Some(i) = SLIDERS.iter().position(|s| s.0 == *field) else {
@@ -817,9 +792,8 @@ impl Camera {
         }
     }
 
-    /// Sends VRChat slider `i` at `v`, held to its range.
-    /// It goes out with the tick's others ([`SEND_SETTINGS`]); an unchanged
-    /// value sends nothing.
+    /// Sets slider `i` to `v`, limited to its range, and sends it with the next
+    /// tick if it changed ([`SEND_SETTINGS`]).
     fn send_slider(&mut self, i: usize, v: f32, out: &mut Vec<Command>) {
         let (_, _, _, lo, hi, ..) = SLIDERS[i];
         let v = v.clamp(lo as f32, hi as f32);
@@ -839,8 +813,8 @@ impl Camera {
         }
     }
 
-    /// The sliders set since the last send, each at its latest value; the
-    /// optics wait while they rest ([`REST_TICKS`]).
+    /// Sends the sliders that changed. Optics wait until they can be sent again
+    /// ([`REST_TICKS`]).
     pub(crate) fn send_settings(&mut self, out: &mut Vec<Command>) {
         let optic = |i: &usize| OPTIC_FIELDS.contains(&SLIDERS[*i].0);
         let (waiting, due): (Vec<usize>, Vec<usize>) = std::mem::take(&mut self.sliders_due)
@@ -860,17 +834,14 @@ impl Camera {
         self.rest_later(out);
     }
 
-    /// The sliders set since the last send, now, rest or not: a jump's,
-    /// which lands whole.
+    /// Sends all sliders that changed, without waiting.
     pub(crate) fn send_settings_now(&mut self, out: &mut Vec<Command>) {
         self.resting = 0;
         self.send_settings(out);
     }
 
-    /// With no clock running, a timer ends the optics' rest: it counts
-    /// from the tick that applies it, the one after the send, so it ends on
-    /// the tick [`REST_TICKS`] after, due half a tick early so a tick's
-    /// jitter never slips it one.
+    /// Starts the timer until the optics can be sent again. It is due half a
+    /// tick early, so that jitter doesn't delay it by a whole tick.
     pub(crate) fn rest_later(&mut self, out: &mut Vec<Command>) {
         if self.resting > 0 && !self.ticking {
             out.push(Command::Timer {
@@ -880,13 +851,13 @@ impl Camera {
         }
     }
 
-    /// The optics' rest ended: values set meanwhile go now.
+    /// The optics can be sent again.
     fn rested(&mut self, out: &mut Vec<Command>) {
         self.resting = 0;
         self.send_settings(out);
     }
 
-    /// VRChat's reports of `setting`, just sent, wait until it settles
+    /// Makes VRChat's reports of `setting` wait until it has settled
     /// ([`SETTLE_SETTINGS`]).
     fn hold(&mut self, setting: Setting, out: &mut Vec<Command>) {
         if !self.settings_sent.iter().any(|(s, _)| *s == setting) {
@@ -898,8 +869,7 @@ impl Camera {
         });
     }
 
-    /// VRChat reported `setting` at `v`: kept for when it settles while it
-    /// is held, else taken now.
+    /// Handles VRChat's report of a setting: at once, or when it has settled.
     fn reported_setting(&mut self, setting: Setting, v: f32, out: &mut Vec<Command>) {
         match self.settings_sent.iter_mut().find(|(s, _)| *s == setting) {
             Some((_, report)) => *report = Some(v),
@@ -914,7 +884,7 @@ impl Camera {
         }
     }
 
-    /// Whether VRChat smooths the camera's movement.
+    /// Whether movement smoothing is on.
     pub(crate) fn smoothing(&self) -> bool {
         TOGGLES
             .iter()
@@ -922,8 +892,7 @@ impl Camera {
             .is_some_and(|i| self.toggles[i])
     }
 
-    /// Where the view shows the camera: as sent while smoothing, else the
-    /// pose.
+    /// The camera's pose in the 3D view: the smoothed one while smoothing.
     pub(crate) fn shown_pose(&self) -> [f32; 6] {
         self.follow.map_or(self.pose, |f| f.pose)
     }
@@ -959,7 +928,7 @@ impl Camera {
         self.flying.retain(|f| !leveled.contains(f));
     }
 
-    /// Whether VRChat levels what `fly` turns: its pad is off.
+    /// Whether VRChat levels the rotation of `fly`, which disables its pad.
     pub(crate) fn leveled(&self, fly: Fly) -> bool {
         fly.leveled_by()
             .and_then(|field| TOGGLES.iter().position(|t| t.0 == field))
@@ -1019,8 +988,8 @@ impl Camera {
                         self.reported_setting(Setting::Slider(i), v, out);
                     }
                 } else if let Some(i) = TOGGLES.iter().position(|t| t.1 == name) {
-                    // While this smooths, VRChat's smoothing is off by its
-                    // doing, not the person's.
+                    // While this smooths, it has switched off VRChat's
+                    // smoothing itself.
                     let ours = TOGGLES[i].0 == SMOOTH_MOVEMENT && self.overriding;
                     if let Some(v) = first.and_then(arg_bool).filter(|_| !ours) {
                         self.reported_setting(Setting::Toggle(i), f32::from(u8::from(v)), out);
@@ -1044,7 +1013,7 @@ impl Camera {
         if let Some(i) = TOGGLES.iter().position(|t| t.0 == field) {
             let on = matches!(value, Value::Bool(true));
             match (field == SMOOTH_MOVEMENT && self.overriding, on) {
-                // VRChat's comes back on once this stops driving.
+                // VRChat's smoothing is switched back on when this stops.
                 (true, true) => {}
                 (true, false) => {
                     self.overriding = false;
@@ -1066,8 +1035,8 @@ impl Camera {
         self.send_pose(pose, out);
     }
 
-    /// A call; `id` is a script's, none for the page's. Every call is
-    /// answered here, but a coroutine's that plays, when it ends.
+    /// Handles a method call. `id` is `None` for a call from the page. A play
+    /// answers its call when it ends; all others are answered here.
     pub(crate) fn on_call(
         &mut self,
         id: Option<u64>,
@@ -1123,7 +1092,7 @@ impl Camera {
                     id,
                     |start| match target {
                         Some(to) => Play::to(id, &to, seconds, start),
-                        None => Play::new(id, Vec::new(), start),
+                        None => Play::path(id, &[], start),
                     },
                     out,
                 );
@@ -1135,8 +1104,8 @@ impl Camera {
 }
 
 impl Camera {
-    /// Shows the editor as it stands: after a `motion` event while the
-    /// clock runs, its camera and playhead alone ([`EDITOR_REFRESH`]).
+    /// Updates the editor. After a `motion` event while the clock runs, only
+    /// its camera and playhead ([`EDITOR_REFRESH`]).
     fn show_editor(&mut self, motion: bool, out: &mut Vec<Command>) {
         let shown = (self.scene_camera(), self.playhead());
         let whole = self.shown_editor.is_none()
@@ -1150,14 +1119,14 @@ impl Camera {
                 out.push(Command::Mark {
                     view: EDITOR.to_owned(),
                     id: "scene".to_owned(),
-                    mark: Mark::Camera(Some(shown.0)),
+                    mark: Mark::Camera(0, shown.0),
                 });
             }
             if shown.1 != self.marked.1 {
                 out.push(Command::Mark {
                     view: EDITOR.to_owned(),
                     id: "timeline".to_owned(),
-                    mark: Mark::Playhead(shown.1),
+                    mark: Mark::Line(0, shown.1),
                 });
             }
             self.marked = shown;
@@ -1170,7 +1139,7 @@ impl Camera {
         if self.shown_editor.as_ref() != Some(&editor) {
             out.push(Command::Modal {
                 id: EDITOR.to_owned(),
-                title: "Camera editor".to_owned(),
+                title: "Advanced Camera".to_owned(),
                 view: editor.clone(),
             });
             self.shown_editor = Some(editor);
@@ -1185,8 +1154,7 @@ impl Extension for Camera {
 
     fn handle(&mut self, event: Event) -> Vec<Command> {
         let mut out = Vec::new();
-        // Its own timers change nothing the editor shows but what moves or
-        // what the next whole view takes up.
+        // These events change nothing in the editor except what moves.
         let motion = matches!(
             &event,
             Event::Timer { .. }
@@ -1210,8 +1178,8 @@ impl Extension for Camera {
             }
             Event::Ui { .. } => {}
             Event::Timer { id, at_ms } if id == PLAY => self.step(at_ms, &mut out),
-            // VRChat's smoothing comes back once this rests, aimed at the
-            // pose it rests at, not one it smoothed toward before.
+            // Switches VRChat's smoothing back on at the current pose, so that
+            // it doesn't continue toward an earlier one.
             Event::Timer { id, .. } if id == SETTLE => {
                 self.settling = false;
                 if std::mem::take(&mut self.overriding) && self.smoothing() {

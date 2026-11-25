@@ -4,7 +4,7 @@ use crate::*;
 use super::support::*;
 use crate::motion::{key_times, pose_at, FRAME, MOVE_SPEED, TURN_SPEED};
 use crate::widgets::{HINT, STAND_IN};
-use vrc_we_sdk::UiEvent;
+use vrc_we_sdk::{Act, UiEvent};
 
 #[test]
 fn the_manifest_validates() {
@@ -82,6 +82,7 @@ fn vrchats_settings_are_written_over_osc_and_read_back() {
     }));
     assert_eq!(fields(&out), [("lock", Value::Bool(true))]);
     cam.handle(press("open_editor"));
+    cam.handle(chosen(EDITOR, "tab", 2));
     let out = cam.handle(ui(
         EDITOR,
         UiEvent::Toggled {
@@ -148,7 +149,7 @@ fn keyframes_follow_the_camera_from_the_tracks_start() {
     assert!(
         shown(&cam, true)
             .iter()
-            .any(|t| t.starts_with("From key 1: right 0, up 0, forward 2 m")),
+            .any(|t| t == "x         2.00  y       1.00  z        0.00 m"),
         "{:?}",
         shown(&cam, true)
     );
@@ -191,24 +192,17 @@ fn start_here_moves_a_track_and_the_view_holds_still_while_the_camera_moves() {
     cam.handle(edit("add_key"));
     cam.handle(pose_in([0.0, 0.0, 2.0, 0.0, 0.0, 0.0]));
     cam.handle(edit("add_key"));
-    let path = |cam: &Camera| match cam.editor() {
-        Node::Split { main, .. } => match *main {
-            Node::Column(items) => match &items[0] {
-                Node::Scene3d {
-                    path, keys, camera, ..
-                } => (keys.iter().map(|k| path[*k]).collect::<Vec<_>>(), *camera),
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        },
-        _ => unreachable!(),
+    let path = |cam: &Camera| {
+        let view = cam.editor();
+        let scene = scene_of(&view).expect("a scene");
+        (keys_of(&view).expect("keys"), scene.cameras[0])
     };
     let (before, _) = path(&cam);
     assert_eq!(before, [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]]);
     cam.handle(pose_in([5.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
     let (after, camera) = path(&cam);
     assert_eq!(after, before, "the camera moving moves no key");
-    assert_eq!(camera.unwrap()[0], [5.0, 0.0, 0.0], "only the camera");
+    assert_eq!(camera[0], [5.0, 0.0, 0.0], "only the camera");
     cam.handle(edit("start_here"));
     assert_eq!(path(&cam).0, [[5.0, 0.0, 0.0], [5.0, 0.0, 2.0]]);
 }
@@ -243,16 +237,7 @@ fn a_dragged_key_moves_between_its_neighbours_and_the_last_sets_the_length() {
     let step = |s: f32| lin([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, s]);
     let (mut cam, _) = with_track("Orbit", &[step(2.0), step(4.0), step(2.0)]);
     cam.handle(press("open_editor"));
-    let drag = |index: usize, value: f64| {
-        ui(
-            EDITOR,
-            UiEvent::Moved {
-                id: "timeline".into(),
-                index,
-                value,
-            },
-        )
-    };
+    let drag = |index: usize, at: f64| drag_key(index, at, 0.5, true);
     let times = |cam: &Camera| crate::motion::key_times(&cam.tracks[0].steps);
     assert_eq!(times(&cam), [0.0, 2.0, 6.0, 8.0]);
     cam.handle(drag(2, 3.0));
@@ -304,18 +289,12 @@ fn the_editor_searches_chooses_and_edits_a_tracks_keys() {
         },
     ));
     let listed = shown(&cam, true);
-    assert!(
-        listed.iter().any(|l| l.starts_with("tracks: Orbit")),
-        "{listed:?}"
-    );
-    assert!(
-        !listed
-            .iter()
-            .any(|l| l.starts_with("tracks:") && l.contains("Dolly")),
-        "{listed:?}"
-    );
+    assert!(listed.contains(&"tracks: Orbit".to_owned()), "{listed:?}");
+    assert!(!listed.iter().any(|l| l == "tracks: Dolly"), "{listed:?}");
+    cam.key = Some(1);
     cam.handle(chosen(EDITOR, "tracks", 0));
     assert_eq!(cam.track, Some(0), "the row is the found track");
+    assert_eq!(cam.key, Some(0), "with its first key");
     cam.handle(chosen(EDITOR, "timeline", 2));
     assert_eq!(cam.key, Some(2));
     assert!(shown(&cam, true).contains(&"s:1:0=Some(0.0)".to_owned()));
@@ -326,14 +305,7 @@ fn the_editor_searches_chooses_and_edits_a_tracks_keys() {
     assert_eq!(cam.tracks[0].steps[0][0], 2.0, "moved earlier");
     cam.handle(edit("key_del"));
     assert_eq!(cam.tracks[0].steps, [FORWARD]);
-    cam.handle(ui(
-        EDITOR,
-        UiEvent::Moved {
-            id: "timeline".into(),
-            index: 1,
-            value: 1.5,
-        },
-    ));
+    cam.handle(drag_key(1, 1.5, 0.5, true));
     assert_eq!(
         cam.tracks[0].steps[0][6], 1.5,
         "a key dragged on the timeline"
@@ -343,7 +315,7 @@ fn the_editor_searches_chooses_and_edits_a_tracks_keys() {
     assert!(shown(&cam, true).contains(&copy));
     assert_eq!(
         wex(&[FORWARD]),
-        "[\n    [0, 0, 1, 0, 0, 0, 0.2, 0, 0, 0.5, 1]\n]"
+        "[\n    [0, 0, 1, 0, 0, 0, 0.2, 0, 0, 0, 0]\n]"
     );
     // A track with no start starts where the camera stood when the editor
     // showed it, and stays there as the camera moves.
@@ -356,7 +328,7 @@ fn the_editor_searches_chooses_and_edits_a_tracks_keys() {
     let playhead = out.iter().find_map(|c| match c {
         Command::Mark {
             id,
-            mark: Mark::Playhead(at),
+            mark: Mark::Line(0, at),
             ..
         } if id == "timeline" => *at,
         _ => None,
@@ -403,13 +375,15 @@ fn the_pads_move_a_stand_in_until_vrchat_reports_a_pose() {
     assert!(out.contains(&Command::Load {
         key: LIBRARY_KEY.into()
     }));
+    cam.handle(press("open_editor"));
+    cam.handle(chosen(EDITOR, "tab", 1));
     let says = |cam: &Camera, first: &str| {
-        shown(cam, false)
+        shown(cam, true)
             .iter()
             .any(|t| t.starts_with(first) && t.ends_with(STAND_IN))
     };
     assert!(says(&cam, OPEN_FIRST));
-    assert!(shown(&cam, false).contains(&"fly:forward".to_owned()));
+    assert!(shown(&cam, true).contains(&"fly:forward".to_owned()));
     cam.handle(Event::Osc(OscMessage {
         addr: MODE.into(),
         args: vec![OscArg::Int(1)],
@@ -419,7 +393,7 @@ fn the_pads_move_a_stand_in_until_vrchat_reports_a_pose() {
         "open, it asks for a move: VRChat reports none before"
     );
     cam.handle(pose_in([1.0, 2.0, 3.0, 0.0, 90.0, 0.0]));
-    assert!(!shown(&cam, false).iter().any(|t| t.ends_with(STAND_IN)));
+    assert!(!shown(&cam, true).iter().any(|t| t.ends_with(STAND_IN)));
     let again = cam.handle(pose_in([1.0, 2.0, 3.0, 0.0, 90.0, 0.0]));
     assert!(
         !again.iter().any(|c| matches!(c, Command::Page { .. })),
@@ -509,18 +483,16 @@ fn the_roll_pads_roll_the_camera_from_any_start() {
 #[test]
 fn a_leveled_turn_disables_its_pads_and_keys_but_poses_keep_their_roll() {
     fn holds(node: &Node, into: &mut Vec<(String, bool, String)>) {
-        match node {
-            Node::Column(items) | Node::Row(items) => items.iter().for_each(|n| holds(n, into)),
-            Node::Split { main, side } => [main, side].into_iter().for_each(|n| holds(n, into)),
-            Node::HoldButton {
-                id, disabled, tip, ..
-            } => into.push((id.clone(), *disabled, tip.clone())),
+        node.each(&mut |n| match n {
+            Node::Button(b) if matches!(b.act, Act::Hold(_)) => {
+                into.push((b.id.clone(), b.disabled, b.tip.clone().unwrap_or_default()))
+            }
             _ => {}
-        }
+        });
     }
     let off = |cam: &Camera| {
         let mut all = Vec::new();
-        holds(cam.shown.as_ref().unwrap(), &mut all);
+        holds(cam.shown_editor.as_ref().unwrap(), &mut all);
         all.into_iter().filter(|h| h.1).collect::<Vec<_>>()
     };
     let level = |field: &str, on: bool| {
@@ -529,9 +501,18 @@ fn a_leveled_turn_disables_its_pads_and_keys_but_poses_keep_their_roll() {
             args: vec![OscArg::Bool(on)],
         })
     };
+    let keyed = |cam: &Camera| -> std::collections::BTreeSet<String> {
+        let editor = cam.shown_editor.as_ref().unwrap().holds();
+        let keyed = editor.into_iter().filter(|h| h.1.is_some() && h.2);
+        keyed.map(|h| h.0.to_owned()).collect()
+    };
     let mut cam = known([0.0; 6]);
     cam.handle(press("open_editor"));
     assert!(off(&cam).is_empty(), "nothing is off while nothing levels");
+    for tab in [0, 2, 1] {
+        cam.handle(chosen(EDITOR, "tab", tab));
+        assert_eq!(keyed(&cam).len(), 12, "every key flies on tab {tab}");
+    }
     cam.handle(ui(
         PAGE,
         UiEvent::Held {
@@ -540,6 +521,7 @@ fn a_leveled_turn_disables_its_pads_and_keys_but_poses_keep_their_roll() {
         },
     ));
     cam.handle(level("AutoLevelRoll", true));
+    cam.handle(timer(PLAY));
     let ids: Vec<String> = off(&cam).into_iter().map(|h| h.0).collect();
     assert_eq!(ids, ["fly:roll_left", "fly:roll_right"]);
     assert!(
@@ -557,6 +539,7 @@ fn a_leveled_turn_disables_its_pads_and_keys_but_poses_keep_their_roll() {
         "a track's roll still goes out: {:?}",
         poses.last()
     );
+    assert_eq!(keyed(&cam).len(), 8, "and their keys are off too");
 }
 
 #[test]
@@ -676,6 +659,7 @@ fn settings_read_vrchats_defaults_until_set_and_start_publishes_them() {
     assert!(published.contains(&("orientation_is_landscape", Value::Bool(true))));
     assert!(published.contains(&("green_screen", Value::Bool(false))));
     cam.handle(press("open_editor"));
+    cam.handle(chosen(EDITOR, "tab", 2));
     let listed = shown(&cam, true);
     assert!(listed.contains(&"zoom=Some(45.0)".to_owned()), "{listed:?}");
     assert!(listed.contains(&"environment=Some(true)".to_owned()));
@@ -685,16 +669,11 @@ fn settings_read_vrchats_defaults_until_set_and_start_publishes_them() {
 fn the_page_opens_the_track_editor_from_one_wide_button() {
     let mut cam = known([0.0; 6]);
     cam.handle(timer("none"));
-    let wide: Vec<String> = match cam.shown.as_ref().unwrap() {
-        Node::Column(rows) => rows
-            .iter()
-            .filter_map(|n| match n {
-                Node::Button { id, wide: true, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let mut wide = Vec::new();
+    cam.shown.as_ref().unwrap().each(&mut |n| match n {
+        Node::Button(b) if b.large => wide.push(b.id.clone()),
+        _ => {}
+    });
     assert_eq!(wide, ["open_editor"]);
     cam.handle(press("open_editor"));
     assert!(cam.editor_open);
@@ -812,23 +791,25 @@ fn every_icon_a_view_names_is_packaged() {
     cam.handle(chosen(EDITOR, "scene", 1));
     cam.handle(timer("none"));
     let packaged: Vec<String> = crate::icons::icons().into_iter().map(|i| i.name).collect();
-    fn named(n: &Node, into: &mut Vec<String>) {
-        match n {
-            Node::Column(items) | Node::Row(items) => items.iter().for_each(|i| named(i, into)),
-            Node::Split { main, side } => [main, side].into_iter().for_each(|n| named(n, into)),
-            Node::Icon { icon } | Node::IconButton { icon, .. } | Node::HoldButton { icon, .. } => {
-                into.push(icon.clone())
-            }
-            Node::Button {
-                icon: Some(icon), ..
-            } => into.push(icon.clone()),
-            _ => {}
-        }
-    }
     let mut used = Vec::new();
-    named(cam.shown.as_ref().unwrap(), &mut used);
-    named(cam.shown_editor.as_ref().unwrap(), &mut used);
-    assert!(used.len() > 20, "{used:?}");
+    let mut named = |view: &Node| {
+        view.each(&mut |n| match n {
+            Node::Button(b) => used.extend(b.icon.clone()),
+            Node::Glyph(g) => used.push(g.icon.clone()),
+            _ => {}
+        })
+    };
+    named(cam.shown.as_ref().unwrap());
+    for tab in 0..3 {
+        cam.handle(chosen(EDITOR, "tab", tab));
+        named(cam.shown_editor.as_ref().unwrap());
+    }
+    let idle: Vec<&String> = packaged.iter().filter(|p| !used.contains(p)).collect();
+    assert_eq!(
+        idle,
+        ["pause"],
+        "every icon packaged is shown, pause in a play"
+    );
     let missing: Vec<&String> = used.iter().filter(|u| !packaged.contains(u)).collect();
     assert!(missing.is_empty(), "{missing:?}");
 }
@@ -1039,23 +1020,26 @@ fn while_the_clock_runs_the_editor_moves_its_camera_and_playhead_alone() {
     assert_eq!(modals, 2, "the whole view now and then");
     run_plays(&mut cam, 10_000);
     let built = scene_of(cam.shown_editor.as_ref().unwrap()).cloned();
-    let Some(Node::Scene3d { camera, hint, .. }) = built else {
-        panic!("a scene");
-    };
-    assert_eq!(camera, Some(cam.scene_camera()), "built anew once it stops");
-    assert_eq!(hint.as_deref(), Some(HINT));
+    let built = built.expect("a scene");
+    assert_eq!(
+        built.cameras,
+        [cam.scene_camera()],
+        "built anew once it stops"
+    );
+    assert_eq!(built.hint, HINT);
 }
 
 #[test]
 fn a_closed_track_draws_its_end_as_its_start() {
     let mut cam = straight_track(3);
-    let closed = |cam: &Camera| match scene_of(cam.shown_editor.as_ref().unwrap()) {
-        Some(Node::Scene3d { closed, .. }) => *closed,
-        _ => panic!("a scene"),
+    let numbers = |cam: &Camera| {
+        let scene = scene_of(cam.shown_editor.as_ref().unwrap()).expect("a scene");
+        let labels = scene.points.iter().map(|p| p.label.clone());
+        labels.map(Option::unwrap_or_default).collect::<Vec<_>>()
     };
-    assert!(!closed(&cam));
+    assert_eq!(numbers(&cam), ["1", "2", "3"]);
     cam.handle(chosen(EDITOR, "loop", 1));
-    assert!(closed(&cam));
+    assert_eq!(numbers(&cam), ["1", "2", "3", ""]);
 }
 
 #[test]
@@ -1109,14 +1093,13 @@ fn scrubbing_the_ruler_puts_the_camera_there_and_play_goes_on_from_there() {
 fn the_settings_sliders_move_vrchats_camera_as_they_are_dragged() {
     let mut cam = known([0.0; 6]);
     cam.handle(press("open_editor"));
-    fn live(n: &Node, id: &str) -> Option<bool> {
-        match n {
-            Node::Slider { id: at, live, .. } if at == id => Some(*live),
-            Node::Column(items) | Node::Row(items) => items.iter().find_map(|i| live(i, id)),
-            Node::Split { main, side } => live(main, id).or_else(|| live(side, id)),
+    cam.handle(chosen(EDITOR, "tab", 2));
+    let live = |n: &Node, id: &str| {
+        part(n, |n| match n {
+            Node::Slider(s) if s.id == id => Some(s.live),
             _ => None,
-        }
-    }
+        })
+    };
     let editor = cam.shown_editor.as_ref().unwrap();
     assert_eq!(live(editor, "zoom"), Some(true));
     assert_eq!(live(editor, "exposure"), Some(true));
@@ -1327,4 +1310,20 @@ fn a_play_whose_keys_share_their_optics_sends_no_setting_and_only_poses() {
         [POSE],
         "a static zoom is never sent: only poses go out"
     );
+}
+
+#[test]
+fn the_lens_tab_shows_every_setting_once() {
+    let mut grouped: Vec<&str> = crate::view::SETTINGS
+        .iter()
+        .flat_map(|(_, fields)| fields.iter().copied())
+        .collect();
+    grouped.sort_unstable();
+    let mut all: Vec<&str> = SLIDERS
+        .iter()
+        .map(|s| s.0)
+        .chain(TOGGLES.iter().map(|t| t.0))
+        .collect();
+    all.sort_unstable();
+    assert_eq!(grouped, all);
 }

@@ -1,5 +1,4 @@
-//! How the camera moves: a path's steps and the legs they make, plays
-//! along them, and flying while a pad is held.
+//! Camera motion: paths, plays along them, smoothing, and flying by hand.
 
 use glam::{EulerRot, Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -7,36 +6,33 @@ use vrc_we_sdk::{Command, Key, Value, TICK_HZ};
 
 use crate::{Camera, PLAY, PLAY_ENDED, SETTINGS_TICKS};
 
-/// The most steps a path takes; how far (metres) and how far round
-/// (degrees) one step may go; how long one may last.
+/// The limits of a path: its number of steps, and the metres, degrees and
+/// seconds of one step.
 pub(crate) const PATH_MAX: usize = 1024;
 pub(crate) const STEP_REACH: f64 = 1000.0;
 pub(crate) const STEP_TURN: f64 = 3600.0;
 pub(crate) const STEP_SECONDS: f64 = 600.0;
 
-/// A tick's seconds: a step's when the clock has no earlier tick to
-/// measure from.
+/// The duration of one tick, for a step of the clock with no previous tick.
 pub(crate) const FRAME: f32 = 1.0 / TICK_HZ as f32;
 
-/// The longest step one tick takes, in milliseconds: a tick late by more
-/// moves no further, so a stall never jumps the camera.
+/// The most time one tick advances, in milliseconds, so that a stall never
+/// makes the camera jump.
 const STEP_MAX_MS: u64 = 100;
 
-/// Degrees a pixel of right-drag turns the camera.
+/// Degrees the camera turns per pixel of a right-button drag.
 const LOOK_PER_PX: f32 = 0.2;
 
-/// The camera's own smoothing: its time constant at VRChat's strength `s`
-/// is `SMOOTH_SECONDS.0 · s ^ SMOOTH_SECONDS.1` seconds, so a low strength
-/// stays quick (0.04 s at 1) and 10 trails for about a second.
+/// Smoothing time constant: at VRChat's smoothing strength `s` it is
+/// `SMOOTH_SECONDS.0 * s.powf(SMOOTH_SECONDS.1)` seconds.
 pub(crate) const SMOOTH_SECONDS: (f32, f32) = (0.04, 1.4);
 
-/// Where the camera is sent while this smooths its moves: an elastic per
-/// position and angle toward the pose (whose angles run on,
-/// [`continuing`]), closing the same share of what is left each moment.
-/// It moves the moment the pose does, as fast as it is far behind: a steady
-/// move is followed at its own speed a constant distance behind, a stop is
-/// reached without overshoot, and having no momentum of its own, nothing
-/// cancels another move's.
+/// The smoothed pose sent to VRChat, which approaches the camera's pose
+/// exponentially.
+///
+/// The approach has no momentum: it starts as soon as the pose moves, follows a
+/// steady move at a constant distance, and stops without overshoot. Its angles
+/// are continuous ([`continuing`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Follow {
     pub(crate) pose: [f32; 6],
@@ -47,8 +43,7 @@ impl Follow {
         Self { pose }
     }
 
-    /// `dt` seconds toward `to` at `rate` a second, exactly as the elastic
-    /// closes on a pose held still that long.
+    /// Advances `dt` seconds toward `to`, at `rate` per second.
     pub(crate) fn step(&mut self, to: &[f32; 6], rate: f32, dt: f32) {
         let left = (-rate * dt).exp();
         for (at, goal) in self.pose.iter_mut().zip(to) {
@@ -56,18 +51,19 @@ impl Follow {
         }
     }
 
-    /// Whether it rests on `to`: within a millimetre and a twentieth of a
-    /// degree, so its last step to `to` is never a visible jump.
+    /// Whether it is close enough to `to` (1 mm and 0.05°) to stop without a
+    /// visible jump.
     pub(crate) fn settled(&self, to: &[f32; 6]) -> bool {
         position(&self.pose).distance(position(to)) < 1e-3
             && (3..6).all(|k| (self.pose[k] - to[k]).abs() < 0.05)
     }
 }
 
-/// Where the person's play of a track goes on from: the track (by key),
-/// the step it was on and the seconds into it, and where the camera was
-/// then; none when a key was chosen instead, so the play snaps to it.
-/// Steps, not seconds: a step of 0 s ends where the next starts.
+/// Where playing a track resumes: the track's key, the step and the seconds
+/// into it, and the camera's pose at the time. `pose` is `None` if a keyframe
+/// was selected instead, so the camera starts by jumping to it.
+///
+/// The step is stored because the time alone is ambiguous next to steps of 0 s.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Resume {
     pub(crate) track: String,
@@ -77,53 +73,70 @@ pub(crate) struct Resume {
 }
 
 impl Resume {
-    /// The seconds along its track, on `steps`.
+    /// The time along the track, in seconds.
     pub(crate) fn at(&self, steps: &[Step]) -> f32 {
         let before: f32 = steps.iter().take(self.step).map(|s| s[6]).sum();
         before + self.elapsed
     }
 }
 
-/// A path step: a move (right, up, forward) from the point before, on the
-/// start pose's heading, the change of pitch, yaw and roll in degrees, the
-/// seconds it takes (0 jumps), its curve ([`Curve`]), then the camera's
-/// optics at the key it reaches ([`Optics`]). The first [`WIRE`] numbers
-/// are what crosses to scripts and contacts; the optics stay with the
-/// library's track.
+/// A step of a path: the move (right, up, forward) from the previous key
+/// relative to the start's heading, the change of pitch, yaw and roll in
+/// degrees, the duration in seconds (0 jumps), the curve ([`Curve`]), and the
+/// camera's optics at the key it reaches ([`Optics`]).
+///
+/// Scripts and contacts only see the first [`WIRE`] values. The optics stay in
+/// the library.
 pub(crate) type Step = [f32; 15];
 pub(crate) const WIRE: usize = 11;
 
-/// VRChat's zoom, focal distance, aperture and exposure ([`OPTIC_FIELDS`]),
-/// from [`OPTICS`] on in a step: what a key holds of the camera's settings,
-/// eased between keys as the move is.
+/// Zoom, focal distance, aperture and exposure ([`OPTIC_FIELDS`]) at a key,
+/// stored in a step from index [`OPTICS`].
 pub(crate) type Optics = [f32; 4];
 pub(crate) const OPTICS: usize = 11;
 
-/// A step's curve, from [`CURVE`] on: the handle lengths at the key it
-/// leaves and at the key it reaches (0 along the step's own chord, so
-/// straight; 1 the key's automatic direction; a third of the chord long),
-/// and its pace dot: where along the step (0–1) and how fast there, as a
-/// multiple of the step's average pace.
+/// The curve of a step, stored from index [`CURVE`]: the handle lengths at the
+/// key it leaves and the key it reaches (0 straight, 1 the automatic
+/// direction), and the ramps at both ([`RAMP_RANGE`]). In a library track, the
+/// two steps at a key share its ramp ([`join_ramps`]).
 pub(crate) type Curve = [f32; 4];
 pub(crate) const CURVE: usize = 7;
 pub(crate) const OUT_LEN: usize = 7;
 pub(crate) const IN_LEN: usize = 8;
-pub(crate) const DOT_AT: usize = 9;
-pub(crate) const DOT_PACE: usize = 10;
+pub(crate) const OUT_RAMP: usize = 9;
+pub(crate) const IN_RAMP: usize = 10;
 
-/// A straight step at an even pace: what a step of 7 numbers, and a flight
-/// to a pose, is.
-pub(crate) const LINEAR: Curve = [0.0, 0.0, 0.5, 1.0];
-/// A new key's curve before any key was chosen: smooth, at an even pace.
-pub(crate) const SMOOTH: Curve = [1.0, 1.0, 0.5, 1.0];
+/// A straight step at an even pace.
+pub(crate) const LINEAR: Curve = [0.0, 0.0, 0.0, 0.0];
+/// The curve of a new key when none has been selected yet.
+pub(crate) const SMOOTH: Curve = [1.0, 1.0, 0.0, 0.0];
 
-/// The longest handle, in automatic lengths; the slowest and fastest a pace
-/// dot goes, as multiples of its step's average.
+/// The longest handle.
 pub(crate) const HANDLE_MAX: f64 = 1.0;
 
-/// How a track ends: open; closed, its last step the way back to its start
-/// and the curve joined there; or looping, closed and played round until
-/// stopped.
+/// The range of a ramp: the lowest stops, 0 is an even pace, the highest is the
+/// fastest.
+pub(crate) const RAMP_RANGE: (f64, f64) = (-100.0, 100.0);
+
+/// The exponent that maps a ramp's height to a pace ([`pace_at`]).
+const RAMP_POWER: f32 = 1.585;
+
+/// The minimum pace between two keys that both stop, relative to the average.
+const PACE_FLOOR: f32 = 0.02;
+
+/// The number of samples of a step's pace.
+const PACE_SAMPLES: usize = 32;
+
+/// Tolerance when comparing a time to the end of a leg, for rounding errors of
+/// summed ticks.
+const TIME_SLACK: f32 = 1e-4;
+
+/// The number of samples used to measure a curve's length.
+const ARC_SAMPLES: usize = 32;
+
+/// How a track ends: at its last key, back at its start (`Closed`), or back at
+/// its start and over again (`Looping`). The last step of a closed or looping
+/// track leads back to its start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Loop {
@@ -134,13 +147,15 @@ pub(crate) enum Loop {
 }
 
 impl Loop {
+    pub(crate) const ALL: [Loop; 3] = [Loop::Open, Loop::Closed, Loop::Looping];
+
     pub(crate) fn closed(self) -> bool {
         self != Loop::Open
     }
 }
 
-/// The last of `steps` made the way back to its start: its move and turn
-/// undo all the others', and it reaches the start's optics, when given.
+/// Makes the last of `steps` return to the start: its move and turn undo those
+/// of all the others, and it reaches the start's optics if given.
 pub(crate) fn reclose(steps: &mut [Step], optics: Option<Optics>) {
     let Some((last, rest)) = steps.split_last_mut() else {
         return;
@@ -152,22 +167,30 @@ pub(crate) fn reclose(steps: &mut [Step], optics: Option<Optics>) {
         last[OPTICS..].copy_from_slice(&o);
     }
 }
-pub(crate) const PACE_RANGE: (f64, f64) = (0.05, 2.0);
 
-/// How far a pace dot stays inside its step's ends, as a share of it, so
-/// both pieces of the pace keep a width.
-const DOT_INSET: f32 = 0.004;
+/// Makes the steps at each key share its ramp. The ramp of the start is
+/// `start`, which is also the ramp of the end if `closed`.
+pub(crate) fn join_ramps(steps: &mut [Step], start: f32, closed: bool) {
+    if let Some(last) = steps.last_mut().filter(|_| closed) {
+        last[IN_RAMP] = start;
+    }
+    let mut ramp = start;
+    for s in steps {
+        s[OUT_RAMP] = ramp;
+        ramp = s[IN_RAMP];
+    }
+}
 
-/// How close to a leg's end its time counts as reached: what adding up a
-/// tick's seconds rounds off.
-const TIME_SLACK: f32 = 1e-4;
+/// The ramp at key `key` (0 is the start).
+pub(crate) fn key_ramp(steps: &[Step], key: usize) -> f32 {
+    match key.checked_sub(1) {
+        Some(i) => steps.get(i).map_or(0.0, |s| s[IN_RAMP]),
+        None => steps.first().map_or(0.0, |s| s[OUT_RAMP]),
+    }
+}
 
-/// The samples of a leg's curve its length is measured at.
-const ARC_SAMPLES: usize = 32;
-
-/// `values` as a step: 7 numbers are a straight one at an even pace, 11 a
-/// whole one without optics (read as none), 15 one with them; anything
-/// else is none.
+/// Parses a step: 7 values for a straight one at an even pace, [`WIRE`] for one
+/// without optics, 15 for one with optics.
 pub(crate) fn step_of(values: &[f32]) -> Option<Step> {
     let mut s = [0.0; 15];
     match values.len() {
@@ -182,19 +205,19 @@ pub(crate) fn step_of(values: &[f32]) -> Option<Step> {
     Some(s)
 }
 
-/// `step` with `curve`.
+/// `step` with the given curve.
 pub(crate) fn with_curve(mut step: Step, curve: Curve) -> Step {
     step[CURVE..WIRE].copy_from_slice(&curve);
     step
 }
 
-/// `step` reaching `optics`.
+/// `step` with the given optics.
 pub(crate) fn with_optics(mut step: Step, optics: Optics) -> Step {
     step[OPTICS..].copy_from_slice(&optics);
     step
 }
 
-/// The optics each key of `steps` holds, from the start's `first`.
+/// The optics at each key, where `first` are those of the start.
 pub(crate) fn key_optics(first: Optics, steps: &[Step]) -> Vec<Optics> {
     std::iter::once(first)
         .chain(steps.iter().map(|s| {
@@ -205,8 +228,8 @@ pub(crate) fn key_optics(first: Optics, steps: &[Step]) -> Vec<Optics> {
         .collect()
 }
 
-/// Where a path has reached, from its start: a position on the start
-/// pose's heading, and how far pitch, yaw and roll have changed.
+/// A point on a path relative to its start: the position relative to the
+/// start's heading, and the change of pitch, yaw and roll.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Offset {
     pub(crate) pos: Vec3,
@@ -219,7 +242,7 @@ impl Offset {
         turn: Vec3::ZERO,
     };
 
-    /// `self` then `step`.
+    /// This offset followed by `step`.
     pub(crate) fn then(self, step: &Step) -> Offset {
         Offset {
             pos: self.pos + Vec3::new(step[0], step[1], step[2]),
@@ -228,38 +251,120 @@ impl Offset {
     }
 }
 
-/// The pace of a step with its dot at `at`, `pace` times its average, at
-/// `t` (0–1) of its time: two cubic Hermite pieces, from 1 at the key it
-/// leaves to `pace` at the dot (level there) and on to 1 at the key it
-/// reaches, the keys' slopes ±6(1 − `pace`) in each piece's own span. Each
-/// piece then averages exactly 1, so the step keeps its time whatever its
-/// dot, and the pace stays between about 1 − 0.67(`pace` − 1) and `pace`
-/// (never below 0 over [`PACE_RANGE`]).
-pub(crate) fn pace(at: f32, pace: f32, t: f32) -> f32 {
-    let (c, slope) = (dot_place(at), 6.0 * (1.0 - pace));
-    match t.clamp(0.0, 1.0) {
-        t if t <= c => hermite(1.0, slope, pace, 0.0, t / c),
-        t => hermite(pace, 0.0, 1.0, -slope, (t - c) / (1.0 - c)),
+/// The height of a ramp, from 0 (stopped) over 0.5 (an even pace) to 1 (the
+/// fastest).
+pub(crate) fn height(ramp: f32) -> f32 {
+    (ramp / 200.0 + 0.5).clamp(0.0, 1.0)
+}
+
+/// The ramp of a height.
+pub(crate) fn ramp_at(height: f32) -> f32 {
+    (height - 0.5) * 200.0
+}
+
+/// The pace at a ramp height, as a multiple of the even pace.
+fn pace_at(height: f32) -> f32 {
+    (2.0 * height.max(0.0)).powf(RAMP_POWER)
+}
+
+/// The ramp of a pace, given as a multiple of the even pace.
+pub(crate) fn ramp_of_pace(pace: f32) -> f32 {
+    ramp_at((pace.max(0.0).powf(1.0 / RAMP_POWER) / 2.0).min(1.0))
+}
+
+/// The ramp curve over a step: the heights at both ends, and the slopes there
+/// in height per second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Ramp {
+    pub(crate) heights: [f32; 2],
+    pub(crate) slopes: [f32; 2],
+}
+
+impl Ramp {
+    /// The height at `u` (0–1) of a step that takes `seconds`.
+    pub(crate) fn at(&self, u: f32, seconds: f32) -> f32 {
+        let ([from, to], [out, into]) = (self.heights, self.slopes);
+        hermite(from, out * seconds, to, into * seconds, u)
     }
 }
 
-/// How far along a step (0–1) its pace has carried it at `t` of its time:
-/// the integral of [`pace`]; the dot is reached at `at`.
-pub(crate) fn progress(at: f32, pace: f32, t: f32) -> f32 {
-    let (c, slope) = (dot_place(at), 6.0 * (1.0 - pace));
-    match t.clamp(0.0, 1.0) {
-        t if t <= c => c * hermite_area(1.0, slope, pace, 0.0, t / c),
-        t => c + (1.0 - c) * hermite_area(pace, 0.0, 1.0, -slope, (t - c) / (1.0 - c)),
-    }
+/// The steps before and after key `key`, if the pace continues from one to the
+/// other: both take time and have the same ramp there. The start and end of a
+/// `closed` path are the same key.
+fn joined(steps: &[Step], key: usize, closed: bool) -> Option<(usize, usize)> {
+    let n = steps.len();
+    let (into, out) = match key {
+        0 if closed && n > 1 => (n - 1, 0),
+        k if k == n && closed && n > 1 => (n - 1, 0),
+        k if k > 0 && k < n => (k - 1, k),
+        _ => return None,
+    };
+    let (a, b) = (&steps[into], &steps[out]);
+    (a[6] > 0.0 && b[6] > 0.0 && a[IN_RAMP] == b[OUT_RAMP]).then_some((into, out))
 }
 
-/// Where a pace dot set at `at` sits: [`DOT_INSET`] inside its step's ends.
-pub(crate) fn dot_place(at: f32) -> f32 {
-    at.clamp(DOT_INSET, 1.0 - DOT_INSET)
+/// The ramp curve of each step, as cubic Hermite splines.
+///
+/// The slope at a key is the mean of the two adjacent chords, each weighted by
+/// the other step's duration. It is limited to 3 times the shallower chord, or
+/// half of it at a turning point, to avoid overshoot. An end that isn't joined
+/// to another step takes its slope from the other end. All slopes are limited
+/// so that the Bézier control points, and with them the curve, stay between 0
+/// and 1.
+pub(crate) fn ramps(steps: &[Step], closed: bool) -> Vec<Ramp> {
+    let heights: Vec<[f32; 2]> = steps
+        .iter()
+        .map(|s| [height(s[OUT_RAMP]), height(s[IN_RAMP])])
+        .collect();
+    let chord = |i: usize| match steps[i][6] > 0.0 {
+        true => (heights[i][1] - heights[i][0]) / steps[i][6],
+        false => 0.0,
+    };
+    let at_key = |key: usize| {
+        let (a, b) = joined(steps, key, closed)?;
+        let (l, r, tl, tr) = (chord(a), chord(b), steps[a][6], steps[b][6]);
+        let most = if l * r > 0.0 { 3.0 } else { 0.5 } * l.abs().min(r.abs());
+        Some(((l * tr + r * tl) / (tl + tr)).clamp(-most, most))
+    };
+    let keys: Vec<Option<f32>> = (0..=steps.len()).map(at_key).collect();
+    let free = |i: usize, other: Option<f32>| {
+        let c = chord(i);
+        let bent = other.map_or(c, |m| 1.5 * c - 0.5 * m);
+        if bent * c < 0.0 {
+            0.0
+        } else {
+            bent
+        }
+    };
+    // Limited by the longer of the two steps at the key, so that both get the
+    // same slope.
+    let held = |key: usize, i: usize, slope: f32, h: f32| {
+        let longest =
+            joined(steps, key, closed).map_or(steps[i][6], |(a, b)| steps[a][6].max(steps[b][6]));
+        let most = if longest > 0.0 {
+            3.0 * h.min(1.0 - h) / longest
+        } else {
+            0.0
+        };
+        slope.clamp(-most, most)
+    };
+    (0..steps.len())
+        .map(|i| {
+            let (out, into) = (keys[i], keys[i + 1]);
+            let h = heights[i];
+            Ramp {
+                heights: h,
+                slopes: [
+                    held(i, i, out.unwrap_or_else(|| free(i, into)), h[0]),
+                    held(i + 1, i, into.unwrap_or_else(|| free(i, out)), h[1]),
+                ],
+            }
+        })
+        .collect()
 }
 
-/// The cubic Hermite from `y0` (slope `m0`) to `y1` (slope `m1`) over 0–1,
-/// at `s`.
+/// The cubic Hermite spline from `y0` (slope `m0`) to `y1` (slope `m1`) at `s`
+/// (0–1).
 fn hermite(y0: f32, m0: f32, y1: f32, m1: f32, s: f32) -> f32 {
     let (s2, s3) = (s * s, s * s * s);
     (2.0 * s3 - 3.0 * s2 + 1.0) * y0
@@ -268,33 +373,109 @@ fn hermite(y0: f32, m0: f32, y1: f32, m1: f32, s: f32) -> f32 {
         + (s3 - s2) * m1
 }
 
-/// The area under [`hermite`] from 0 to `s`.
-fn hermite_area(y0: f32, m0: f32, y1: f32, m1: f32, s: f32) -> f32 {
-    let (s2, s3, s4) = (s * s, s * s * s, s * s * s * s);
-    (s - s3 + s4 / 2.0) * y0
-        + (s2 / 2.0 - 2.0 * s3 / 3.0 + s4 / 4.0) * m0
-        + (s3 - s4 / 2.0) * y1
-        + (s4 / 4.0 - s3 / 3.0) * m1
-}
-
-/// One leg of a path: from one key's offset to the next on a cubic Bezier
-/// (`ctrl` its inner control points, on the start's heading), each angle
-/// in a line, at its step's pace. `arc` is the curve's length up to each
-/// of [`ARC_SAMPLES`] even steps of its parameter, so it is walked by
-/// distance and the pace is a real speed along it.
+/// One leg of a path, between two keys: a cubic Bézier curve in position
+/// (`ctrl` are its inner control points), linear in each angle.
+///
+/// `arc` is the curve's length up to each of [`ARC_SAMPLES`] even parameter
+/// steps. `pace` is the speed at each of [`PACE_SAMPLES`] even time steps, as a
+/// multiple of the average, and `run` is the fraction of the leg covered by
+/// then.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Leg {
     pub(crate) from: Offset,
     pub(crate) to: Offset,
     ctrl: [Vec3; 2],
     pub(crate) seconds: f32,
-    dot: (f32, f32),
     arc: [f32; ARC_SAMPLES + 1],
+    measured: bool,
+    pace: [f32; PACE_SAMPLES + 1],
+    run: [f32; PACE_SAMPLES + 1],
+    paced: bool,
+}
+
+/// The quantity a leg's speed is measured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Metres,
+    Degrees,
 }
 
 impl Leg {
-    /// The curve's point at parameter `s` (0–1): where a drawing samples
-    /// it.
+    /// Measures the curve's length, once.
+    fn measure(&mut self) {
+        if std::mem::replace(&mut self.measured, true) {
+            return;
+        }
+        let mut last = self.from.pos;
+        for j in 1..=ARC_SAMPLES {
+            let p = self.point(j as f32 / ARC_SAMPLES as f32);
+            self.arc[j] = self.arc[j - 1] + p.distance(last);
+            last = p;
+        }
+    }
+
+    /// The distance the leg covers, or the angle if it only turns. `None` if it
+    /// does neither or takes no time.
+    fn reach(&self) -> Option<(Reach, f32)> {
+        let (far, turned) = (self.arc[ARC_SAMPLES], self.from.turn.distance(self.to.turn));
+        if self.seconds <= 0.0 {
+            return None;
+        }
+        if far > 1e-4 {
+            return Some((Reach::Metres, far));
+        }
+        (turned > 1e-3).then_some((Reach::Degrees, turned))
+    }
+
+    /// Computes the pace: the pace of `ramp`, scaled by `keys` (the paces at
+    /// both keys on an even ramp, blended along the leg) and by a bump in the
+    /// middle, solved so that the average is 1. The leg therefore always takes
+    /// its duration, and the pace at a key is the same in both of its legs.
+    fn set_pace(&mut self, ramp: &Ramp, keys: [f32; 2]) {
+        let even = ramp.heights == [0.5; 2] && ramp.slopes == [0.0; 2];
+        if self.seconds <= 0.0 || (even && keys == [1.0; 2]) {
+            return;
+        }
+        let part = |j: usize| j as f32 / PACE_SAMPLES as f32;
+        let swell = |u: f32| 16.0 * (u * (1.0 - u)).powi(2);
+        let (from, to) = (keys[0].ln(), keys[1].ln());
+        let base: [f32; PACE_SAMPLES + 1] = std::array::from_fn(|j| {
+            let u = part(j);
+            let along = (from + (to - from) * u * u * (3.0 - 2.0 * u)).exp();
+            along * (pace_at(ramp.at(u, self.seconds)) + PACE_FLOOR * swell(u))
+        });
+        let swells: [f32; PACE_SAMPLES + 1] = std::array::from_fn(|j| swell(part(j)));
+        let weight = |j: usize| match j {
+            0 | PACE_SAMPLES => 0.5 / PACE_SAMPLES as f32,
+            _ => 1.0 / PACE_SAMPLES as f32,
+        };
+        // The logarithm of the average is convex in `k`, so Newton's method
+        // converges.
+        let mut k = 0.0f32;
+        for _ in 0..16 {
+            let (mut mean, mut rise) = (0.0, 0.0);
+            for j in 0..=PACE_SAMPLES {
+                let v = weight(j) * base[j] * (k * swells[j]).exp();
+                mean += v;
+                rise += v * swells[j];
+            }
+            let off = mean.ln();
+            if off.abs() < 1e-4 {
+                break;
+            }
+            k = (k - (off * mean / rise).clamp(-8.0, 8.0)).clamp(-60.0, 60.0);
+        }
+        let pace: [f32; PACE_SAMPLES + 1] =
+            std::array::from_fn(|j| base[j] * (k * swells[j]).exp());
+        let mean: f32 = (0..=PACE_SAMPLES).map(|j| weight(j) * pace[j]).sum();
+        self.pace = pace.map(|v| v / mean);
+        for j in 1..=PACE_SAMPLES {
+            let mid = (self.pace[j - 1] + self.pace[j]) / 2.0;
+            self.run[j] = self.run[j - 1] + mid / PACE_SAMPLES as f32;
+        }
+    }
+
+    /// The point at curve parameter `s` (0–1).
     pub(crate) fn point(&self, s: f32) -> Vec3 {
         let (p0, p3) = (self.from.pos, self.to.pos);
         let [p1, p2] = self.ctrl;
@@ -302,7 +483,7 @@ impl Leg {
         p0 * (r * r * r) + p1 * (3.0 * r * r * s) + p2 * (3.0 * r * s * s) + p3 * (s * s * s)
     }
 
-    /// The point `f` (0–1) of the way along the curve by distance.
+    /// The point at the fraction `f` (0–1) of the curve's length.
     pub(crate) fn along(&self, f: f32) -> Vec3 {
         let total = self.arc[ARC_SAMPLES];
         if total <= f32::EPSILON {
@@ -322,14 +503,18 @@ impl Leg {
         self.point((j as f32 + part) / ARC_SAMPLES as f32)
     }
 
-    /// How far along (0–1) the leg is `t` (0–1) of its time in, by its pace.
+    /// The fraction of the leg covered after the fraction `t` of its duration.
     pub(crate) fn reached(&self, t: f32) -> f32 {
-        progress(self.dot.0, self.dot.1, t)
+        let at = t.clamp(0.0, 1.0) * PACE_SAMPLES as f32;
+        let j = (at as usize).min(PACE_SAMPLES - 1);
+        let (f, v) = (at - j as f32, &self.pace[j..=j + 1]);
+        let more = v[0] * f + (v[1] - v[0]) * f * f / 2.0;
+        (self.run[j] + more / PACE_SAMPLES as f32).min(1.0)
     }
 
-    /// Where the leg is `t` (0–1) of its time in: each angle in a line by
-    /// the same progress, so the roll of keys without one stays 0 between
-    /// them, and a turn past 180° goes the whole way.
+    /// The offset after the fraction `t` of the leg's duration. Angles are
+    /// interpolated linearly, so a turn past 180° isn't shortened and the roll
+    /// between keys without roll stays 0.
     pub(crate) fn at(&self, t: f32) -> Offset {
         let f = self.reached(t);
         Offset {
@@ -339,10 +524,9 @@ impl Leg {
     }
 }
 
-/// The automatic handle direction at each key of a path through `points`,
-/// joined by `steps`: the mean of the unit chords to its neighbours along
-/// steps that move and take time (a jump breaks the curve); zero with none.
-/// A `closed` path's start and end are one key, neighbours of both ends.
+/// The automatic handle direction at each key: the mean of the unit chords to
+/// its neighbors, along steps that move and take time, or zero. The start and
+/// end of a `closed` path are the same key.
 fn handle_dirs(points: &[Vec3], steps: &[Step], closed: bool) -> Vec<Vec3> {
     let chord = |i: usize| -> Option<Vec3> {
         let d = points[i + 1] - points[i];
@@ -364,35 +548,34 @@ fn handle_dirs(points: &[Vec3], steps: &[Step], closed: bool) -> Vec<Vec3> {
         .collect()
 }
 
-/// A path playing from the pose it started at.
+/// A path being played.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Play {
-    /// The coroutine call it answers when it ends; none for the page's.
+    /// The call it answers when it ends, if any.
     pub(crate) call: Option<u64>,
-    /// The track it plays, by key, when it plays one from the library.
+    /// The key of the library track it plays, if any.
     pub(crate) track: Option<String>,
-    legs: Vec<Leg>,
-    /// The start pose's heading: the offsets move on its axes.
+    path: Path,
+    /// The heading of the start pose, which offsets are relative to.
     frame: Quat,
-    /// The leg it travels.
+    /// The current leg.
     index: usize,
-    /// Seconds along it.
+    /// Seconds into the current leg.
     elapsed: f32,
-    /// The offset it had reached at the last step.
+    /// The offset at the last tick.
     at: Offset,
-    /// It goes round again from its first leg instead of ending.
+    /// Starts over instead of ending.
     repeat: bool,
-    /// Each key's optics, eased between them as it goes; none leaves the
-    /// camera's settings alone.
+    /// The optics at each key. Empty if the play doesn't change them.
     optics: Vec<Optics>,
 }
 
 impl Play {
-    pub(crate) fn new(call: Option<u64>, legs: Vec<Leg>, start: &[f32; 6]) -> Self {
+    fn new(call: Option<u64>, path: Path, start: &[f32; 6]) -> Self {
         Self {
             call,
             track: None,
-            legs,
+            path,
             frame: facing(start),
             index: 0,
             elapsed: 0.0,
@@ -402,14 +585,14 @@ impl Play {
         }
     }
 
-    /// `steps` from `start`.
+    /// A play of `steps` from `start`.
     pub(crate) fn path(call: Option<u64>, steps: &[Step], start: &[f32; 6]) -> Self {
         Self::path_at(call, steps, false, 0, 0.0, start)
     }
 
-    /// `steps` (`closed` when its end is its start) from `elapsed` seconds
-    /// into step `index`, the camera at `pose` there: on the heading its
-    /// start would have had to reach `pose` by then.
+    /// A play that starts `elapsed` seconds into step `index`, with the camera
+    /// at `pose` there. Its heading is the one that leads to `pose` at that
+    /// point.
     pub(crate) fn path_at(
         call: Option<u64>,
         steps: &[Step],
@@ -418,17 +601,17 @@ impl Play {
         elapsed: f32,
         pose: &[f32; 6],
     ) -> Self {
-        let legs = legs(steps, closed);
-        let reached = match legs.get(index) {
+        let mut path = Path::new(steps, closed);
+        let reached = match path.leg(index) {
             Some(leg) if leg.seconds > 0.0 => leg.at(elapsed / leg.seconds),
             Some(leg) => leg.from,
-            None => legs.last().map_or(Offset::ZERO, |l| l.to),
+            None => path.end(),
         };
         Self {
             call,
             track: None,
             frame: euler(0.0, pose[4] - reached.turn.y, 0.0),
-            legs,
+            path,
             index,
             elapsed,
             at: reached,
@@ -437,19 +620,19 @@ impl Play {
         }
     }
 
-    /// It eases the camera's optics through `optics`, one a key.
+    /// The play, applying these optics at its keys.
     pub(crate) fn with_optics(self, optics: Vec<Optics>) -> Self {
         Self { optics, ..self }
     }
 
-    /// The optics of the key it last reached, whole: a key's optics apply
-    /// as the play reaches it, never eased between keys (VRChat stepped a
-    /// pose stream beside an eased zoom). None without any.
+    /// The optics of the last key reached. They are applied at the key and not
+    /// eased between keys, because a stream of settings next to the poses makes
+    /// the motion uneven in VRChat.
     pub(crate) fn optics(&self) -> Option<Optics> {
         self.optics.get(self.index).copied()
     }
 
-    /// It goes round again from its first leg instead of ending.
+    /// The play, starting over instead of ending.
     pub(crate) fn repeating(self) -> Self {
         Self {
             repeat: true,
@@ -457,26 +640,27 @@ impl Play {
         }
     }
 
-    /// One leg from `start` to the pose `to`, in `seconds`, each angle
-    /// turning the short way.
+    /// A play to the pose `to` in a straight line, each angle turning the
+    /// shorter way.
     pub(crate) fn to(call: Option<u64>, to: &[f32; 6], seconds: f32, start: &[f32; 6]) -> Self {
         Self::new(
             call,
-            legs(&[step_to(start, &[], to, seconds)], false),
+            Path::new(&[step_to(start, &[], to, seconds)], false),
             start,
         )
     }
 
-    /// One step of `dt` seconds: the world-space move and the change of
-    /// pitch, yaw and roll its path made since the last step; none once it
-    /// has ended. Time past a leg's end runs on into the next legs (a jump
-    /// at once), so every key is reached at its time, never a tick late.
+    /// Advances `dt` seconds and returns the move in world space and the change
+    /// of pitch, yaw and roll since the last tick, or `None` if it has ended.
+    /// Time past the end of a leg carries over into the next one.
     pub(crate) fn step(&mut self, dt: f32) -> Option<(Vec3, Vec3)> {
-        self.legs.get(self.index)?;
+        if self.index >= self.path.len() {
+            return None;
+        }
         self.elapsed += dt;
         let mut to = self.at;
-        for _ in 0..=self.legs.len() {
-            let Some(leg) = self.legs.get(self.index) else {
+        for _ in 0..=self.path.len() {
+            let Some(leg) = self.path.leg(self.index) else {
                 break;
             };
             if leg.seconds > 0.0 && self.elapsed < leg.seconds - TIME_SLACK {
@@ -486,7 +670,7 @@ impl Play {
             to = leg.to;
             self.elapsed = (self.elapsed - leg.seconds).max(0.0);
             self.index += 1;
-            if self.repeat && self.index == self.legs.len() {
+            if self.repeat && self.index == self.path.len() {
                 self.index = 0;
             }
         }
@@ -497,15 +681,15 @@ impl Play {
     }
 
     pub(crate) fn ended(&self) -> bool {
-        self.legs.is_empty() || (!self.repeat && self.index >= self.legs.len())
+        self.path.len() == 0 || (!self.repeat && self.index >= self.path.len())
     }
 
-    /// The step it is on, and the seconds into it.
+    /// The current step, and the seconds into it.
     pub(crate) fn place(&self) -> (usize, f32) {
         (self.index, self.elapsed)
     }
 
-    /// It plays library track `key`.
+    /// The play, as a play of library track `key`.
     pub(crate) fn of_track(self, key: String) -> Self {
         Self {
             track: Some(key),
@@ -513,17 +697,18 @@ impl Play {
         }
     }
 
-    /// The seconds it has played.
+    /// The time since the start, in seconds.
     pub(crate) fn at(&self) -> f32 {
-        let before: f32 = self.legs[..self.index.min(self.legs.len())]
+        let steps = &self.path.steps;
+        let before: f32 = steps[..self.index.min(steps.len())]
             .iter()
-            .map(|l| l.seconds)
+            .map(|s| s[6])
             .sum();
         before + self.elapsed
     }
 }
 
-/// Each key's offset on a path, from its start (key 0) to its end.
+/// The offset of each key, from the start (key 0) to the end.
 pub(crate) fn key_offsets(steps: &[Step]) -> Vec<Offset> {
     let mut at = Offset::ZERO;
     std::iter::once(at)
@@ -534,25 +719,74 @@ pub(crate) fn key_offsets(steps: &[Step]) -> Vec<Offset> {
         .collect()
 }
 
-/// The legs of a path (`closed` when its end is its start), each measured
-/// along its length ([`shapes`]) so a play walks it at its pace.
-pub(crate) fn legs(steps: &[Step], closed: bool) -> Vec<Leg> {
-    let mut legs = shapes(steps, closed);
-    for leg in &mut legs {
-        let mut last = leg.from.pos;
-        for j in 1..=ARC_SAMPLES {
-            let p = leg.point(j as f32 / ARC_SAMPLES as f32);
-            leg.arc[j] = leg.arc[j - 1] + p.distance(last);
-            last = p;
-        }
-    }
-    legs
+/// A path. Its legs are measured and paced when first used, since doing so for
+/// all of a long path takes too much fuel in one dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Path {
+    steps: Vec<Step>,
+    closed: bool,
+    ramps: Vec<Ramp>,
+    legs: Vec<Leg>,
 }
 
-/// Each step's curve between its keys, unmeasured: for drawing by
-/// [`Leg::point`]. A handle a third of the chord long blends from the
-/// chord (length 0: the leg's straight line, at an even parameter) to the
-/// key's automatic direction (length 1); a jump draws straight.
+impl Path {
+    pub(crate) fn new(steps: &[Step], closed: bool) -> Self {
+        Self {
+            steps: steps.to_vec(),
+            closed,
+            ramps: ramps(steps, closed),
+            legs: shapes(steps, closed),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.legs.len()
+    }
+
+    /// Leg `i`, measured and paced.
+    pub(crate) fn leg(&mut self, i: usize) -> Option<&Leg> {
+        if !self.legs.get(i)?.paced {
+            let ends = [i, i + 1].map(|key| joined(&self.steps, key, self.closed));
+            let beside = ends.into_iter().flatten().flat_map(|(a, b)| [a, b]);
+            for at in beside.chain([i]) {
+                self.legs[at].measure();
+            }
+            let keys = key_paces(&self.legs, &self.steps, self.closed, i);
+            self.legs[i].set_pace(&self.ramps[i], keys);
+            self.legs[i].paced = true;
+        }
+        self.legs.get(i)
+    }
+
+    /// The offset of the end.
+    fn end(&self) -> Offset {
+        self.legs.last().map_or(Offset::ZERO, |l| l.to)
+    }
+}
+
+/// The paces of leg `i` at its two keys on an even ramp, relative to its
+/// average. At a joined key it is the average of both legs, at most twice the
+/// slower one, so that the speed changes gradually. It is 1 if the key isn't
+/// joined or if one leg moves and the other only turns.
+fn key_paces(legs: &[Leg], steps: &[Step], closed: bool, i: usize) -> [f32; 2] {
+    [i, i + 1].map(|key| {
+        let pair = joined(steps, key, closed)
+            .and_then(|(a, b)| Some((&legs[a], legs[a].reach()?, &legs[b], legs[b].reach()?)));
+        match pair {
+            Some((a, (kind, far), b, (other, on))) if kind == other => {
+                let (slow, fast) = (far / a.seconds, on / b.seconds);
+                let mean = (far + on) / (a.seconds + b.seconds);
+                let own = legs[i].reach().map_or(mean, |(_, r)| r / legs[i].seconds);
+                mean.min(2.0 * slow.min(fast)) / own
+            }
+            _ => 1.0,
+        }
+    })
+}
+
+/// The legs of `steps`, without their length and pace. A handle is a third of
+/// the chord long and turns from the chord (length 0) to the key's automatic
+/// direction (length 1). A jump is drawn straight.
 pub(crate) fn shapes(steps: &[Step], closed: bool) -> Vec<Leg> {
     let keys = key_offsets(steps);
     let points: Vec<Vec3> = keys.iter().map(|o| o.pos).collect();
@@ -581,14 +815,18 @@ pub(crate) fn shapes(steps: &[Step], closed: bool) -> Vec<Leg> {
                 to,
                 ctrl,
                 seconds: s[6],
-                dot: (s[DOT_AT], s[DOT_PACE]),
                 arc: [0.0; ARC_SAMPLES + 1],
+                measured: false,
+                pace: [1.0; PACE_SAMPLES + 1],
+                run: std::array::from_fn(|j| j as f32 / PACE_SAMPLES as f32),
+                paced: false,
             }
         })
         .collect()
 }
 
-/// A rotation from pitch, yaw and roll in degrees, in `Pose`'s order.
+/// The rotation of pitch, yaw and roll in degrees, in the order VRChat's `Pose`
+/// uses.
 pub(crate) fn euler(pitch: f32, yaw: f32, roll: f32) -> Quat {
     Quat::from_euler(
         EulerRot::ZXYEx,
@@ -598,13 +836,13 @@ pub(crate) fn euler(pitch: f32, yaw: f32, roll: f32) -> Quat {
     )
 }
 
-/// Pitch, yaw and roll in degrees.
+/// The pitch, yaw and roll of a rotation, in degrees.
 pub(crate) fn angles(q: Quat) -> [f32; 3] {
     let (roll, pitch, yaw) = q.to_euler(EulerRot::ZXYEx);
     [pitch.to_degrees(), yaw.to_degrees(), roll.to_degrees()]
 }
 
-/// A pose from a position and a rotation.
+/// The pose of a position and a rotation.
 pub(crate) fn pose_of(pos: Vec3, rot: Quat) -> [f32; 6] {
     let [pitch, yaw, roll] = angles(rot);
     [pos.x, pos.y, pos.z, pitch, yaw, roll]
@@ -618,8 +856,8 @@ pub(crate) fn rotation(pose: &[f32; 6]) -> Quat {
     euler(pose[3], pose[4], pose[5])
 }
 
-/// Whether two poses are one place, within what VRChat's reports round
-/// off: a centimetre, and about half a degree of view or up.
+/// Whether two poses are the same within the rounding of VRChat's reports (1 cm
+/// and about half a degree).
 pub(crate) fn same_place(a: &[f32; 6], b: &[f32; 6]) -> bool {
     let (ra, rb) = (rotation(a), rotation(b));
     position(a).distance(position(b)) < 0.01
@@ -628,7 +866,7 @@ pub(crate) fn same_place(a: &[f32; 6], b: &[f32; 6]) -> bool {
             .all(|v| (ra * v).distance(rb * v) < 0.01)
 }
 
-/// The pose's heading: its yaw alone.
+/// The rotation of the pose's yaw alone.
 pub(crate) fn facing(pose: &[f32; 6]) -> Quat {
     euler(0.0, pose[4], 0.0)
 }
@@ -638,9 +876,8 @@ fn wrapped(degrees: f32) -> f32 {
     (degrees + 180.0).rem_euclid(360.0) - 180.0
 }
 
-/// `to` with each angle moved by whole turns to within half a turn of
-/// `from`'s: a turn past 180° or 360° goes on past it instead of jumping a
-/// turn back, which VRChat's smoothing would ease the long way round.
+/// `to` with each angle shifted by full turns to be within half a turn of
+/// `from`, so that a turn past 180° doesn't jump back by a full turn.
 pub(crate) fn continuing(from: &[f32; 6], mut to: [f32; 6]) -> [f32; 6] {
     for k in 3..6 {
         to[k] = from[k] + wrapped(to[k] - from[k]);
@@ -648,7 +885,7 @@ pub(crate) fn continuing(from: &[f32; 6], mut to: [f32; 6]) -> [f32; 6] {
     to
 }
 
-/// `pose` with each angle within -180..180.
+/// `pose` with its angles in -180..180.
 pub(crate) fn in_range(mut pose: [f32; 6]) -> [f32; 6] {
     for angle in &mut pose[3..] {
         *angle = wrapped(*angle);
@@ -656,14 +893,13 @@ pub(crate) fn in_range(mut pose: [f32; 6]) -> [f32; 6] {
     pose
 }
 
-/// The step from the end of `steps`, played from `start`, to the world
-/// pose `to`, in `seconds`: its move on the start's heading, and each
-/// angle turning the short way.
+/// The step from the end of `steps`, played from `start`, to the world pose
+/// `to`. Each angle turns the shorter way.
 pub(crate) fn step_to(start: &[f32; 6], steps: &[Step], to: &[f32; 6], seconds: f32) -> Step {
     let end = key_offsets(steps)[steps.len()];
     let pos = facing(start).inverse() * (position(to) - position(start)) - end.pos;
-    // Both through one rotation, so the same orientation always reads the
-    // same angles whatever form VRChat sent them in.
+    // Both angles come from rotations, so equal orientations give equal angles
+    // whichever form VRChat reported them in.
     let (from, to) = (angles(rotation(start)), angles(rotation(to)));
     let turn: [f32; 3] = std::array::from_fn(|k| wrapped(to[k] - from[k] - end.turn[k]));
     with_curve(
@@ -675,8 +911,7 @@ pub(crate) fn step_to(start: &[f32; 6], steps: &[Step], to: &[f32; 6], seconds: 
     )
 }
 
-/// The world pose `elapsed` seconds into step `index` of `steps` (`closed`
-/// when its end is its start) played from `start`.
+/// The world pose `elapsed` seconds into step `index`, played from `start`.
 pub(crate) fn pose_at(
     start: &[f32; 6],
     steps: &[Step],
@@ -684,8 +919,8 @@ pub(crate) fn pose_at(
     index: usize,
     elapsed: f32,
 ) -> [f32; 6] {
-    let legs = legs(steps, closed);
-    let o = match legs.get(index) {
+    let mut path = Path::new(steps, closed);
+    let o = match path.leg(index) {
         Some(leg) if leg.seconds > 0.0 => leg.at((elapsed / leg.seconds).min(1.0)),
         Some(leg) => leg.to,
         None => return key_pose(start, steps, index),
@@ -695,8 +930,7 @@ pub(crate) fn pose_at(
     [at.x, at.y, at.z, turn.x, turn.y, turn.z]
 }
 
-/// The step `seconds` into `steps` falls in and how far into it, held to
-/// the path.
+/// The step at time `seconds`, and the seconds into it, limited to the path.
 pub(crate) fn place_at(steps: &[Step], seconds: f32) -> (usize, f32) {
     let times = key_times(steps);
     let i = (0..steps.len())
@@ -706,8 +940,7 @@ pub(crate) fn place_at(steps: &[Step], seconds: f32) -> (usize, f32) {
     (i, into)
 }
 
-/// Key `key`'s world pose on `steps` played from `start` (key 0 is the
-/// start, key `n` the end of step `n - 1`).
+/// The world pose of key `key` (0 is the start), played from `start`.
 pub(crate) fn key_pose(start: &[f32; 6], steps: &[Step], key: usize) -> [f32; 6] {
     let o = key_offsets(steps)[key.min(steps.len())];
     let at = position(start) + facing(start) * o.pos;
@@ -715,18 +948,15 @@ pub(crate) fn key_pose(start: &[f32; 6], steps: &[Step], key: usize) -> [f32; 6]
     [at.x, at.y, at.z, turn.x, turn.y, turn.z]
 }
 
-/// Adds `sign` times `change` to the move and turn of `step`, its seconds
-/// kept.
+/// Adds `sign * change` to the step's move and turn.
 fn shift(step: &mut Step, change: &[f32; 6], sign: f32) {
     for (v, c) in step.iter_mut().zip(change) {
         *v += sign * c;
     }
 }
 
-/// Key `key` (1 or more) of `steps` played from `start` moved to the world
-/// pose `to`, every other key kept where it is: the step into it takes the
-/// change, the step out of it gives it back, so a turn typed past 180°
-/// keeps its whole turns.
+/// Moves key `key` (1 or more) to the world pose `to`, leaving the other keys
+/// in place.
 pub(crate) fn set_key(start: &[f32; 6], steps: &mut [Step], key: usize, to: &[f32; 6]) {
     let Some(i) = key.checked_sub(1).filter(|i| *i < steps.len()) else {
         return;
@@ -739,10 +969,25 @@ pub(crate) fn set_key(start: &[f32; 6], steps: &mut [Step], key: usize, to: &[f3
     }
 }
 
-/// A key at the world pose `to` inserted after key `key` of `steps`
-/// played from `start`, every other key kept where it is and when it is:
-/// the new step, of `curve`, takes half the following step's seconds, or
-/// `seconds` after the last key.
+/// Moves key `index` (1 or more) to `at` seconds, limited to the times of its
+/// neighbors, which stay in place.
+pub(crate) fn retime_key(steps: &mut [Step], index: usize, at: f32) {
+    let times = key_times(steps);
+    let Some(i) = index.checked_sub(1).filter(|i| *i < steps.len()) else {
+        return;
+    };
+    let (before, after) = (times[i], times.get(index + 1).copied());
+    let at = at.max(before).min(after.unwrap_or(f32::INFINITY));
+    let cap = STEP_SECONDS as f32;
+    steps[i][6] = (at - before).min(cap);
+    if let (Some(after), Some(next)) = (after, steps.get_mut(index)) {
+        next[6] = (after - at).min(cap);
+    }
+}
+
+/// Inserts a key at the world pose `to` after key `key`, leaving the other keys
+/// in place and on time: the new step takes half the duration of the next one,
+/// or `seconds` at the end.
 pub(crate) fn insert_key(
     start: &[f32; 6],
     steps: &mut Vec<Step>,
@@ -762,9 +1007,8 @@ pub(crate) fn insert_key(
     steps.insert(at, new);
 }
 
-/// `steps` played from `from` rewritten to play from `to`, every key after
-/// the start kept where it is: each move turns onto `to`'s heading, and the
-/// first step takes the change of place and angles.
+/// Rewrites `steps`, played from `from`, to be played from `to` with the keys
+/// after the start in the same place.
 pub(crate) fn restart(steps: &mut [Step], from: &[f32; 6], to: &[f32; 6]) {
     let onto = facing(to).inverse() * facing(from);
     for s in steps.iter_mut() {
@@ -780,8 +1024,8 @@ pub(crate) fn restart(steps: &mut [Step], from: &[f32; 6], to: &[f32; 6]) {
     }
 }
 
-/// A step's values within their ranges; its optics are held to theirs as
-/// they go to VRChat.
+/// A step with its values limited to their ranges. Its optics are limited when
+/// they are sent.
 pub(crate) fn clamp_step(mut s: Step) -> Step {
     for (k, v) in s[..WIRE].iter_mut().enumerate() {
         let (low, high) = match k {
@@ -789,8 +1033,7 @@ pub(crate) fn clamp_step(mut s: Step) -> Step {
             3..=5 => (-STEP_TURN, STEP_TURN),
             6 => (0.0, STEP_SECONDS),
             OUT_LEN | IN_LEN => (0.0, HANDLE_MAX),
-            DOT_AT => (0.0, 1.0),
-            _ => PACE_RANGE,
+            _ => RAMP_RANGE,
         };
         *v = match v.is_finite() {
             true => v.clamp(low as f32, high as f32),
@@ -800,7 +1043,7 @@ pub(crate) fn clamp_step(mut s: Step) -> Step {
     s
 }
 
-/// A way a held pad flies the camera.
+/// The directions the camera can be flown in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fly {
     Forward,
@@ -818,8 +1061,7 @@ pub(crate) enum Fly {
 }
 
 impl Fly {
-    /// The toggle (a `TOGGLES` field) under which VRChat levels what this
-    /// pad turns, undoing it.
+    /// The toggle that makes VRChat level this rotation, if any.
     pub(crate) fn leveled_by(self) -> Option<&'static str> {
         match self {
             Fly::PitchUp | Fly::PitchDown => Some("auto_level_pitch"),
@@ -828,56 +1070,74 @@ impl Fly {
         }
     }
 
-    /// Each pad: its id on a view (`fly:<id>`), its icon, its tip and the
-    /// key that holds it.
-    pub(crate) const PADS: [(Fly, &'static str, &'static str, &'static str, Key); 12] = [
-        (Fly::Forward, "forward", "up", "Forward", Key::Char('w')),
-        (Fly::Back, "back", "down", "Back", Key::Char('s')),
-        (Fly::Left, "left", "left", "Left", Key::Char('a')),
-        (Fly::Right, "right", "right", "Right", Key::Char('d')),
-        (Fly::Rise, "rise", "rise", "Up", Key::Space),
-        (Fly::Sink, "sink", "sink", "Down", Key::Shift),
-        (Fly::PitchUp, "pitch_up", "tilt_up", "Tilt up", Key::Up),
-        (
+    pub(crate) const PADS: [Pad; 12] = [
+        Pad::new(
+            Fly::Forward,
+            "fly:forward",
+            "forward",
+            "Forward",
+            Key::Char('w'),
+        ),
+        Pad::new(Fly::Back, "fly:back", "back", "Back", Key::Char('s')),
+        Pad::new(Fly::Left, "fly:left", "left", "Left", Key::Char('a')),
+        Pad::new(Fly::Right, "fly:right", "right", "Right", Key::Char('d')),
+        Pad::new(Fly::Rise, "fly:rise", "rise", "Up", Key::Space),
+        Pad::new(Fly::Sink, "fly:sink", "sink", "Down", Key::Shift),
+        Pad::new(Fly::PitchUp, "fly:pitch_up", "tilt_up", "Tilt up", Key::Up),
+        Pad::new(
             Fly::PitchDown,
-            "pitch_down",
+            "fly:pitch_down",
             "tilt_down",
             "Tilt down",
             Key::Down,
         ),
-        (Fly::YawLeft, "yaw_left", "pan_left", "Turn left", Key::Left),
-        (
+        Pad::new(
+            Fly::YawLeft,
+            "fly:yaw_left",
+            "pan_left",
+            "Turn left",
+            Key::Left,
+        ),
+        Pad::new(
             Fly::YawRight,
-            "yaw_right",
+            "fly:yaw_right",
             "pan_right",
             "Turn right",
             Key::Right,
         ),
-        (
+        Pad::new(
             Fly::RollLeft,
-            "roll_left",
+            "fly:roll_left",
             "roll_left",
             "Roll left",
             Key::Char('q'),
         ),
-        (
+        Pad::new(
             Fly::RollRight,
-            "roll_right",
+            "fly:roll_right",
             "roll_right",
             "Roll right",
             Key::Char('e'),
         ),
     ];
 
-    /// The pad `id` names.
-    pub(crate) fn of(id: &str) -> Option<Fly> {
-        Self::PADS.iter().find(|p| p.1 == id).map(|p| p.0)
+    /// The pad for this direction.
+    pub(crate) fn pad(self) -> &'static Pad {
+        Self::PADS
+            .iter()
+            .find(|p| p.fly == self)
+            .expect("every way has a pad")
     }
 
-    /// Its move (right, up, forward: on the camera's axes when navigating
-    /// locally, else level on its heading) and its turn (pitch and roll on
-    /// the camera's axes, yaw about the world's vertical), each a unit a
-    /// second.
+    /// The direction of the pad with this id.
+    pub(crate) fn of_id(id: &str) -> Option<Fly> {
+        Self::PADS.iter().find(|p| p.id == id).map(|p| p.fly)
+    }
+
+    /// The move (right, up, forward) and the turn (pitch, yaw, roll) per
+    /// second, at speed 1. Moves are relative to the camera with local
+    /// navigation, and to its heading otherwise. Yaw turns around the world's
+    /// vertical axis.
     fn rate(self) -> (Vec3, [f32; 3]) {
         let mv = |x, y, z| (Vec3::new(x, y, z), [0.0; 3]);
         let turn = |p, y, r| (Vec3::ZERO, [p, y, r]);
@@ -898,17 +1158,43 @@ impl Fly {
     }
 }
 
-/// The pads' move speed in metres a second, and their turn speed in
-/// degrees a second: (lowest, highest, at first). Both are set on a slider
-/// spread by ratio.
+/// A button that flies the camera while it is held.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pad {
+    pub(crate) fly: Fly,
+    pub(crate) id: &'static str,
+    pub(crate) icon: &'static str,
+    pub(crate) tip: &'static str,
+    pub(crate) key: Key,
+}
+
+impl Pad {
+    const fn new(
+        fly: Fly,
+        id: &'static str,
+        icon: &'static str,
+        tip: &'static str,
+        key: Key,
+    ) -> Self {
+        Self {
+            fly,
+            id,
+            icon,
+            tip,
+            key,
+        }
+    }
+}
+
+/// The flying speeds in metres and degrees per second: minimum, maximum,
+/// default.
 pub(crate) const MOVE_SPEED: (f32, f32, f32) = (0.01, 100.0, 2.0);
 pub(crate) const TURN_SPEED: (f32, f32, f32) = (0.1, 360.0, 45.0);
 
-/// How much one wheel line, while a pad is held, multiplies the move speed.
+/// The factor one line of the wheel changes the move speed by.
 pub(crate) const SPEED_PER_LINE: f32 = 1.25;
 
-/// When each point of a path is reached, from its start: 0, then the end of
-/// each step.
+/// The time of each key, starting at 0.
 pub(crate) fn key_times(steps: &[Step]) -> Vec<f32> {
     let mut at = 0.0;
     std::iter::once(0.0)
@@ -920,10 +1206,9 @@ pub(crate) fn key_times(steps: &[Step]) -> Vec<f32> {
 }
 
 impl Camera {
-    /// Starts the play `make` builds from the camera's pose. A play with no
-    /// legs answers at once. One with legs always runs: on VRChat's camera
-    /// while it reports a pose, else on the stand-in. A mapping's play then
-    /// never depends on the game being open.
+    /// Starts the play `make` builds from the camera's pose. A play without
+    /// steps is answered at once. Without a camera in VRChat, it moves the
+    /// stand-in.
     pub(crate) fn start(
         &mut self,
         call: Option<u64>,
@@ -931,7 +1216,7 @@ impl Camera {
         out: &mut Vec<Command>,
     ) {
         let play = make(&self.pose);
-        if play.legs.is_empty() {
+        if play.path.len() == 0 {
             out.extend(call.map(|id| Command::Reply {
                 id,
                 value: Value::None,
@@ -946,7 +1231,7 @@ impl Camera {
     pub(crate) fn wind(&mut self, out: &mut Vec<Command>) {
         if !self.ticking {
             self.ticking = true;
-            // Its first tick sends the pose.
+            // The first tick sends the pose.
             self.beat = 0;
             out.push(Command::Timer {
                 id: PLAY.to_owned(),
@@ -964,9 +1249,8 @@ impl Camera {
         });
     }
 
-    /// The clock stops. Angles a turn took past a whole turn come back in
-    /// range: a stand-in's here, a linked camera's as VRChat next reports
-    /// it once it settles.
+    /// Marks the clock as stopped. The stand-in's angles return to -180..180;
+    /// those of VRChat's camera do with its next report.
     fn rest(&mut self) {
         self.ticking = false;
         self.last_tick = None;
@@ -975,8 +1259,7 @@ impl Camera {
         }
     }
 
-    /// A pad went down (`down`) or was let go: the camera flies that way
-    /// while it is held.
+    /// Starts or stops flying in a direction.
     pub(crate) fn fly_held(&mut self, fly: Fly, down: bool, out: &mut Vec<Command>) {
         match down {
             true if !self.flying.contains(&fly) => {
@@ -988,10 +1271,8 @@ impl Camera {
         }
     }
 
-    /// One step of every play, held pad and look, added up into one pose
-    /// sent at `at_ms` (the tick's time), as far as the time since the last
-    /// tick; a play that ended answers its call. The clock runs while
-    /// anything moves.
+    /// One tick: advances every play, held direction and look, and sends the
+    /// resulting pose. The clock runs while any of them is active.
     pub(crate) fn step(&mut self, at_ms: u64, out: &mut Vec<Command>) {
         let dt = match self.last_tick {
             Some(last) if at_ms > last => (at_ms - last).min(STEP_MAX_MS) as f32 / 1000.0,
@@ -1024,7 +1305,7 @@ impl Camera {
         }
     }
 
-    /// `dt` seconds of every play, held pad and look, sent as one pose.
+    /// Applies `dt` seconds of every play, held direction and look to the pose.
     fn move_step(&mut self, dt: f32, out: &mut Vec<Command>) {
         let pose = self.pose;
         let (mut pos, mut turn) = (position(&pose), Vec3::new(pose[3], pose[4], pose[5]));
@@ -1044,8 +1325,7 @@ impl Camera {
             let mut rot = rotation(&pose);
             for fly in &self.flying {
                 let (along, [pitch, yaw, roll]) = fly.rate();
-                // Level, a move keeps its height: forward and right lie on
-                // the heading, up is the world's.
+                // Level navigation keeps the height: moves follow the heading.
                 let axes = match self.local_nav {
                     true => rot,
                     false => euler(0.0, angles(rot)[1], 0.0),
@@ -1081,15 +1361,13 @@ impl Camera {
         self.send_pose(pose, out);
     }
 
-    /// Ends every play, answering their calls; the clock stops unless a
-    /// pad is held.
+    /// Ends every play and answers their calls.
     pub(crate) fn end_plays(&mut self, out: &mut Vec<Command>) {
         self.end_plays_where(|_| true, out);
     }
 
-    /// Ends the plays `hit` picks, answering their calls; the person's
-    /// play of a track is kept to go on from. The clock stops once nothing
-    /// runs on it.
+    /// Ends the plays that match `hit` and answers their calls. A track started
+    /// by the user can be resumed from here.
     pub(crate) fn end_plays_where(&mut self, hit: impl Fn(&Play) -> bool, out: &mut Vec<Command>) {
         let (ended, going): (Vec<Play>, Vec<Play>) = std::mem::take(&mut self.plays)
             .into_iter()

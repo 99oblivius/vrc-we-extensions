@@ -43,7 +43,7 @@ pub struct Manifest {
     /// log names players.
     #[serde(default)]
     pub log_prefixes: Vec<String>,
-    /// The icons its views may show ([`Node::Icon`]), at most
+    /// The icons its views may show ([`Glyph`]), at most
     /// [`ICONS_MAX`], each SVG at most [`ICON_MAX`] bytes and self-contained
     /// ([`icon_is_self_contained`]).
     #[serde(default)]

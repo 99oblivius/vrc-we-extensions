@@ -10,8 +10,8 @@ It is the large worked example: everything an extension can declare except secre
 |---|---|
 | namespace | `@CAMERA`: fields `x`, `y`, `z`, `pitch`, `yaw`, `roll`, `mode`, the settings sliders and toggles, the methods below, and one signal, `play_ended` |
 | OSC | reads and writes `/usercamera/` only |
-| page | `camera`: the pads, capture, mode, the settings sliders and toggles |
-| modal | the editor: a 3D view of the path, a timeline of keys, the track library |
+| page | `camera`: modes, photos, and the tracks and positions to play and fly to |
+| modal | the advanced camera: the track library, a 3D view, tabs for keys, flying and the lens, and a timeline of keys and ramps |
 | actions | 12, from Capture and Play track to the four moves and turns |
 | conditions | one, on `mode` |
 | store | its library of tracks and positions, as JSON: an index, and each track's steps under its own key |
@@ -28,10 +28,10 @@ Every method except `track`, `position` and `add_key` is marked for contacts. A 
 |---|---|
 | `lib.rs` | the flow: the `Extension` implementation, the pose stream, OSC in and out, and command routing |
 | `manifest.rs` | what the module declares: the namespace, fields, methods, OSC prefixes, page, actions, condition and icons |
-| `motion.rs` | the maths: a heading-frame offset, the three angle changes, a play's interpolation and optics, `PATH_MAX` |
+| `motion.rs` | camera motion: paths, ramps and pace, plays, smoothing, flying |
 | `library.rs` | tracks and positions: their JSON form, naming, the store |
-| `view.rs` | the two views as `Node` trees: the timeline, the 3D scene, the side panel |
-| `widgets.rs` | the pieces they are built from: buttons, fields, sliders, the pace lane, the key panel |
+| `view.rs` | the page and the modal, and what their controls do |
+| `widgets.rs` | the parts the views are built from |
 | `icons.rs` | the packaged SVGs the views draw |
 | `tests.rs` | the behaviour, driven as events and asserted as commands |
 

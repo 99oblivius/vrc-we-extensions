@@ -7,8 +7,8 @@
 //! Extensions window (Settings → Extensions → Install from file).
 
 use vrc_we_sdk::{
-    Action, Command, Condition, Does, Event, Extension, Field, Manifest, Method, Namespace, Node,
-    Page, Param, Range, Shape, Signal, UiEvent, Value,
+    col, Action, Button, Command, Condition, Does, Event, Extension, Field, Manifest, Method,
+    Namespace, Page, Param, Range, Shape, Signal, Toggle, UiEvent, Value,
 };
 
 vrc_we_sdk::export!(Template);
@@ -38,21 +38,12 @@ impl Template {
             },
             Command::Page {
                 page: PAGE.into(),
-                view: Node::Column(vec![
-                    Node::Heading("Template".into()),
-                    Node::Text(format!("Count: {}", self.count)),
-                    Node::Toggle {
-                        id: "armed".into(),
-                        label: "Armed".into(),
-                        value: Some(self.armed),
-                    },
-                    Node::Button {
-                        id: "reset".into(),
-                        label: "Reset".into(),
-                        icon: None,
-                        wide: false,
-                    },
-                ]),
+                view: col![
+                    format!("Count: {}", self.count),
+                    Toggle::new("armed", "Armed", Some(self.armed)),
+                    Button::new("reset", "Reset"),
+                ]
+                .into(),
             },
             Command::Store {
                 key: COUNT.into(),

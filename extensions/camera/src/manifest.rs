@@ -1,13 +1,12 @@
-//! What the module declares: the `@CAMERA` namespace, its fields and methods,
-//! the OSC prefixes it reads and writes, the page, the actions, the condition
-//! and the packaged icons. `lib.rs` keeps the flow.
+//! The manifest: the `@CAMERA` namespace, the OSC prefixes, the page, the
+//! actions, the condition and the icons.
 
 use vrc_we_sdk::{
     Action, Condition, Does, Field, Manifest, Method, Namespace, Page, Param, Range, Shape, Signal,
 };
 
 use crate::icons;
-use crate::motion::{HANDLE_MAX, PACE_RANGE, PATH_MAX, STEP_REACH, STEP_SECONDS, STEP_TURN};
+use crate::motion::{HANDLE_MAX, PATH_MAX, RAMP_RANGE, STEP_REACH, STEP_SECONDS, STEP_TURN};
 use crate::{NAME_MAX, PAGE, PLAY_ENDED, POSE_FIELDS, POSITIONS, ROOT, SLIDERS, TOGGLES, TRACKS};
 
 pub(crate) fn build() -> Manifest {
@@ -44,8 +43,8 @@ pub(crate) fn build() -> Manifest {
     step.push(Shape::Number(Some(Range::new(0.0, STEP_SECONDS))));
     let handle = Shape::Number(Some(Range::new(0.0, HANDLE_MAX)));
     step.extend([handle.clone(), handle]);
-    step.push(Shape::Number(Some(Range::new(0.0, 1.0))));
-    step.push(Shape::Number(Some(Range::new(PACE_RANGE.0, PACE_RANGE.1))));
+    let ramp = Shape::Number(Some(Range::new(RAMP_RANGE.0, RAMP_RANGE.1)));
+    step.extend([ramp.clone(), ramp]);
     let path = Shape::List {
         item: Box::new(Shape::Tuple(step)),
         max: PATH_MAX,
@@ -191,12 +190,12 @@ pub(crate) fn build() -> Manifest {
 
 /// The pose fields' summaries, in [`POSE_FIELDS`] order.
 const POSE_SUMMARIES: [&str; 6] = [
-    "Camera position on the world's x axis",
-    "Camera position on the world's y axis",
-    "Camera position on the world's z axis",
-    "Camera pitch, in degrees",
-    "Camera yaw, in degrees",
-    "Camera roll, in degrees",
+    "Position on the world's x axis",
+    "Position on the world's y axis",
+    "Position on the world's z axis",
+    "Pitch, in degrees",
+    "Yaw, in degrees",
+    "Roll, in degrees",
 ];
 
 fn method_summary(name: &str) -> &'static str {
@@ -208,7 +207,7 @@ fn method_summary(name: &str) -> &'static str {
         "capture" => "Takes a photo",
         "capture_delayed" => "Takes a photo after a delay",
         "close" => "Closes the camera",
-        "fly_path" => "Flies the camera along a track",
+        "fly_path" => "Flies along a track",
         "fly_to" => "Flies to a saved position over seconds",
         "track" => "A saved track's steps, by name",
         "position" => "A saved position's pose, by name",

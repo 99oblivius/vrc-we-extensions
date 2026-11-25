@@ -1,28 +1,112 @@
-//! The camera's views: its page, the editor modal, and what a press on
-//! either does.
+//! The camera's page and its editor modal, and what their controls do.
 
 use crate::widgets::*;
 
-use vrc_we_sdk::{significant, Command, Node, UiEvent, Value, SLIDER_FIGURES};
+use vrc_we_sdk::{
+    col, row, significant, Align, Button, Choice, Command, Flow, Frame, Grid, Ink, Key, Node,
+    Path3, Point3, Scene, Size, Slider, Stroke, Surface, Text, TextSize, Toggle, UiEvent, Value,
+    SLIDER_FIGURES,
+};
 
 use crate::library::{clean_name, free_name, Position, Track};
 use crate::motion::{
-    angles, clamp_step, facing, insert_key, key_pose, key_times, place_at, pose_at, position,
-    restart, rotation, same_place, set_key, shapes, step_to, with_curve, with_optics, Curve, Fly,
-    Loop, Optics, Play, Resume, Step, DOT_AT, DOT_PACE, MOVE_SPEED, PATH_MAX, SPEED_PER_LINE,
-    STEP_SECONDS, TURN_SPEED,
+    angles, clamp_step, facing, in_range, insert_key, key_pose, key_times, place_at, pose_at,
+    position, ramp_at, restart, retime_key, rotation, same_place, set_key, shapes, step_to,
+    with_curve, with_optics, Curve, Fly, Loop, Optics, Play, Resume, Step, MOVE_SPEED, PATH_MAX,
+    SPEED_PER_LINE, TURN_SPEED,
 };
 use crate::{
     wex, wex_number, Camera, CHOOSE_KEY, MODES, MOVE_FIRST, NAME_TAKEN, OPEN_FIRST, SAVE, SAVE_MS,
     SLIDERS, SMOOTHING_STRENGTH, SMOOTH_MOVEMENT, TOGGLES,
 };
 
-/// The editor modal's id.
+/// The id of the editor modal.
 pub(crate) const EDITOR: &str = "editor";
 
+/// The tabs of the editor's right panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Tab {
+    #[default]
+    Key,
+    Fly,
+    Lens,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Key, Tab::Fly, Tab::Lens];
+    const FACES: [(&'static str, &'static str); 3] =
+        [("Key", "key"), ("Fly", "fly"), ("Lens", "lens")];
+}
+
+/// The widths of the editor's panels, and the gap between their fields.
+const TRACKS_PX: f32 = 224.0;
+const TABS_PX: f32 = 288.0;
+const PANEL_GAP: f32 = 8.0;
+
+/// The labels of [`Loop::ALL`].
+const LOOPS: [&str; 3] = ["Plays once", "Ends at its start", "Loops forever"];
+
+/// VRChat's camera settings in groups, by field.
+pub(crate) const SETTINGS: [(&str, &[&str]); 7] = [
+    (
+        "Lens",
+        &[
+            "zoom",
+            "focal_distance",
+            "aperture",
+            "exposure",
+            "show_focus",
+        ],
+    ),
+    (
+        "In the photo",
+        &[
+            "local_player",
+            "remote_player",
+            "environment",
+            "show_ui_in_camera",
+            "orientation_is_landscape",
+        ],
+    ),
+    (
+        "Green screen",
+        &["green_screen", "hue", "saturation", "lightness"],
+    ),
+    (
+        "Movement",
+        &[
+            "smooth_movement",
+            "smoothing_strength",
+            "auto_level_roll",
+            "auto_level_pitch",
+            "flying",
+            "roll_while_flying",
+            "fly_speed",
+            "turn_speed",
+        ],
+    ),
+    (
+        "Look at me",
+        &["look_at_me", "look_at_me_x_offset", "look_at_me_y_offset"],
+    ),
+    (
+        "Dolly",
+        &["photo_rate", "duration", "dolly_paths_stay_visible"],
+    ),
+    (
+        "Other",
+        &["lock", "trigger_takes_photos", "streaming", "camera_ears"],
+    ),
+];
+
+/// The icons of [`MODES`].
+const MODE_ICONS: [&str; 7] = [
+    "power", "capture", "stream", "emoji", "layers", "print", "drone",
+];
+
 impl Camera {
-    /// What has to happen before VRChat reports its camera: open it, or,
-    /// open but not moved since this started, move it once.
+    /// What the user has to do for VRChat to report its camera: open it, or
+    /// move it if it is already open.
     pub(crate) fn without_pose(&self) -> &'static str {
         match self.mode {
             Some(mode) if mode > 0 => MOVE_FIRST,
@@ -30,7 +114,7 @@ impl Camera {
         }
     }
 
-    /// The tracks whose names hold the search, by index.
+    /// The indices of the tracks whose names match the search.
     pub(crate) fn found(&self) -> Vec<usize> {
         let needle = self.search.to_lowercase();
         (0..self.tracks.len())
@@ -38,145 +122,133 @@ impl Camera {
             .collect()
     }
 
-    /// Whether track `key` is playing.
+    /// Whether track `key` is being played.
     fn playing(&self, key: &str) -> bool {
         self.plays.iter().any(|p| p.track.as_deref() == Some(key))
     }
 
-    /// The pads, hold-to-fly: moves on the camera's axes and turns, their
-    /// speeds and how they move; first a line while they move a stand-in.
-    fn pads(&self) -> Vec<Node> {
+    /// The Fly tab: the pads, their speeds, and how the camera moves.
+    fn fly_rows(&self) -> Vec<Node> {
         let hold = |fly: Fly| {
-            let (_, id, icon, tip, key) = Fly::PADS
-                .iter()
-                .find(|p| p.0 == fly)
-                .copied()
-                .expect("every fly has a pad");
+            let pad = fly.pad();
             let disabled = self.leveled(fly);
-            let tip = match fly
+            let leveled_by = fly
                 .leveled_by()
-                .and_then(|f| TOGGLES.iter().find(|t| t.0 == f))
-            {
-                Some(t) if disabled => format!("{tip} (off while {} is on)", t.2),
-                _ => tip.to_owned(),
+                .and_then(|field| TOGGLES.iter().find(|t| t.0 == field));
+            let tip = match leveled_by {
+                Some(toggle) if disabled => format!("{} (off while {} is on)", pad.tip, toggle.2),
+                _ => pad.tip.to_owned(),
             };
-            Node::HoldButton {
-                id: format!("fly:{id}"),
-                icon: icon.to_owned(),
-                tip,
-                key: Some(key),
-                disabled,
-            }
+            let button = Button::hold(pad.id, pad.icon, tip, Some(pad.key));
+            Node::from(button.disabled(disabled))
         };
         let pad = |label: &str, rows: [[Fly; 3]; 2]| {
-            let mut col = vec![text(label)];
-            col.extend(rows.map(|row| Node::Row(row.map(hold).to_vec())));
-            Node::Column(col)
+            let keys = rows.into_iter().flatten().map(hold).collect();
+            col![label, Grid::new(3, keys)]
         };
         let mut rows = Vec::new();
         if !self.linked {
-            rows.push(text(format!("{} {STAND_IN}", self.without_pose())));
+            rows.push(format!("{} {STAND_IN}", self.without_pose()).into());
         }
         rows.extend([
-            Node::Row(vec![
+            row![
                 pad(
                     "Move",
                     [
                         [Fly::Rise, Fly::Forward, Fly::Sink],
                         [Fly::Left, Fly::Back, Fly::Right],
                     ],
-                ),
+                )
+                .width(Size::Fill),
                 pad(
                     "Turn",
                     [
                         [Fly::RollLeft, Fly::PitchUp, Fly::RollRight],
                         [Fly::YawLeft, Fly::PitchDown, Fly::YawRight],
                     ],
-                ),
-            ]),
-            Node::Row(vec![
-                speed_slider("pad_move", "Move (m/s)", MOVE_SPEED, self.move_speed),
-                speed_slider("pad_turn", "Turn (°/s)", TURN_SPEED, self.turn_speed),
-            ]),
-            Node::Row(vec![
-                Node::Toggle {
-                    id: "local_nav".to_owned(),
-                    label: "Local navigation".to_owned(),
-                    value: Some(self.local_nav),
-                },
-                button("level", "Level the horizon", Some("level"), false),
-            ]),
+                )
+                .width(Size::Fill),
+            ]
+            .into(),
+            row![
+                speed_slider("pad_move", "Move speed (m/s)", MOVE_SPEED, self.move_speed),
+                speed_slider("pad_turn", "Turn speed (°/s)", TURN_SPEED, self.turn_speed),
+            ]
+            .into(),
+            button("level", "Level the horizon", "level").into(),
+            Toggle::new("local_nav", "Local navigation", Some(self.local_nav)).into(),
         ]);
+        rows.extend(self.setting(SMOOTHING_STRENGTH));
         rows
     }
 
-    /// VRChat's camera settings: its sliders, then its toggles, two a row.
-    /// Smoothing reads 0 while Smooth movement is off.
+    /// The camera's modes in `columns` columns, and the photo buttons.
+    fn mode_rows(&self, columns: u8) -> Vec<Node> {
+        let modes = MODES.into_iter().zip(MODE_ICONS);
+        let mode = self.mode.and_then(|m| usize::try_from(m).ok());
+        vec![
+            Button::grid("mode", modes, mode, columns).into(),
+            row![
+                button("capture", "Take a photo", "capture"),
+                button("capture_delayed", "With timer", "timer"),
+            ]
+            .wrap(true)
+            .into(),
+        ]
+    }
+
+    /// The slider or the switch of a camera setting. The smoothing slider shows
+    /// 0 while smoothing is off.
+    fn setting(&self, field: &str) -> Option<Node> {
+        if let Some(i) = TOGGLES.iter().position(|t| t.0 == field) {
+            let toggle = Toggle::new(field, TOGGLES[i].2, Some(self.toggles[i]));
+            return Some(toggle.into());
+        }
+        let i = SLIDERS.iter().position(|s| s.0 == field)?;
+        let (_, _, label, min, max, ..) = SLIDERS[i];
+        let value = f64::from(self.sliders[i]);
+        let (min, value) = match field == SMOOTHING_STRENGTH {
+            true if !self.smoothing() => (0.0, 0.0),
+            true => (0.0, value),
+            false => (min, value),
+        };
+        let slider = Slider::new(field, label, (min, max), Some(value));
+        Some(slider.live(true).into())
+    }
+
+    /// The Lens tab: VRChat's camera modes and settings.
     fn settings_rows(&self) -> Vec<Node> {
-        let sliders: Vec<Node> = SLIDERS
-            .iter()
-            .zip(self.sliders)
-            .map(|((field, _, label, min, max, ..), v)| {
-                let (min, v) = match *field == SMOOTHING_STRENGTH {
-                    true if !self.smoothing() => (0.0, 0.0),
-                    true => (0.0, f64::from(v)),
-                    false => (*min, f64::from(v)),
-                };
-                Node::Slider {
-                    id: (*field).to_owned(),
-                    label: (*label).to_owned(),
-                    min,
-                    max: *max,
-                    value: Some(v),
-                    log: false,
-                    live: true,
-                }
-            })
-            .collect();
-        let toggles: Vec<Node> = TOGGLES
-            .iter()
-            .zip(self.toggles)
-            .map(|((field, _, label, ..), v)| Node::Toggle {
-                id: (*field).to_owned(),
-                label: (*label).to_owned(),
-                value: Some(v),
-            })
-            .collect();
-        let mut rows = vec![
-            text(
-                "VRChat's settings, read from VRChat when this starts; VRChat doesn't report a slider moved in-game.",
-            ),
-        ];
-        rows.extend(sliders.chunks(2).map(|pair| Node::Row(pair.to_vec())));
-        rows.extend(toggles.chunks(2).map(|pair| Node::Row(pair.to_vec())));
+        let mut rows: Vec<Node> = vec![Text::heading("Mode").into()];
+        rows.extend(self.mode_rows(2));
+        rows.push(Node::Divider);
+        for (name, fields) in SETTINGS {
+            rows.push(Text::heading(name).into());
+            rows.extend(fields.iter().filter_map(|field| self.setting(field)));
+            rows.push(Node::Divider);
+        }
+        rows.push(
+            "Read from VRChat as this starts; VRChat doesn't report a slider moved in game.".into(),
+        );
         rows
     }
 
-    /// Positions to fly to, and saving the camera's.
-    fn positions_rows(&self, id: &str) -> Vec<Node> {
-        let mut rows = vec![
-            heading("Positions"),
-            text("Positions belong to the world they were saved in."),
+    /// The saved positions as buttons, and a button that saves the current one.
+    /// The editor marks the selected position.
+    fn positions_rows(&self, id: &str, columns: u8) -> Vec<Node> {
+        let mut rows: Vec<Node> = vec![
+            Text::heading("Positions").into(),
+            "Each belongs to the world it was saved in.".into(),
         ];
         if !self.positions.is_empty() {
-            rows.push(Node::Buttons {
-                id: id.to_owned(),
-                options: self.positions.iter().map(|p| p.name.clone()).collect(),
-                selected: (id == "pick_position").then_some(self.spot).flatten(),
-                columns: 3,
-            });
+            let chosen = (id == "pick_position").then_some(self.spot).flatten();
+            let names = self.positions.iter().map(|p| (p.name.as_str(), "pin"));
+            rows.push(Button::grid(id, names, chosen, columns).into());
         }
-        rows.push(button(
-            "save_position",
-            "Save the camera's position",
-            None,
-            false,
-        ));
+        rows.push(button("save_position", "Save position", "add").into());
         rows
     }
 
-    /// The track playing's (or a pause's) place in seconds, on the edited
-    /// track.
+    /// The time of the edited track's playhead, if it is playing or paused.
     pub(crate) fn playhead(&self) -> Option<f32> {
         let t = self.track.and_then(|i| self.tracks.get(i))?;
         self.plays
@@ -190,7 +262,7 @@ impl Camera {
                 .map(|r| r.at(&t.steps)))
     }
 
-    /// The 3D view's camera: where it is shown, the way it faces, its top.
+    /// The camera in the 3D view: its position, forward and up.
     pub(crate) fn scene_camera(&self) -> [[f32; 3]; 3] {
         let p = self.shown_pose();
         let rot = rotation(&p);
@@ -201,231 +273,294 @@ impl Camera {
         ]
     }
 
-    /// What the page and the editor show while a stored value couldn't be
-    /// read: the reason, and the one press that replaces it (a fresh, empty
-    /// index written over it).
+    /// Shown on the page and in the editor when a stored value can't be read,
+    /// with a button that starts a new library.
     fn unreadable_view(&self) -> Node {
-        Node::Column(vec![
-            heading("Camera"),
-            text(UNREADABLE),
-            button("library_reset", NEW_LIBRARY, None, false),
-        ])
+        col![UNREADABLE, Button::delete("library_reset", NEW_LIBRARY),].into()
     }
 
-    /// The page: the camera's mode and actions, the pads, the tracks to
-    /// play and the positions to fly to.
+    /// The page: the camera's modes, the tracks and the positions.
     pub(crate) fn page(&self) -> Node {
         if self.unreadable {
             return self.unreadable_view();
         }
-        let mut rows = vec![
-            heading("Camera"),
-            Node::Buttons {
-                id: "mode".to_owned(),
-                options: MODES.iter().map(|m| (*m).to_owned()).collect(),
-                selected: self.mode.and_then(|m| usize::try_from(m).ok()),
-                columns: 4,
-            },
-            Node::Row(vec![
-                icon_button("capture", "capture", "Capture"),
-                icon_button("capture_delayed", "timer", "Capture after a delay"),
-                icon_button("close", "close", "Close the camera"),
-            ]),
-        ];
-        rows.extend(self.pads());
+        let mut rows = self.mode_rows(3);
         rows.push(Node::Divider);
-        rows.push(heading("Tracks"));
-        rows.push(name_field("search", "Search", &self.search, true));
+        rows.push(Text::heading("Tracks").into());
+        rows.push(
+            name_field("search", "Search", &self.search)
+                .live(true)
+                .into(),
+        );
         for i in self.found() {
             let t = &self.tracks[i];
-            let (icon, tip) = match self.playing(&t.key) {
+            let (icon, label) = match self.playing(&t.key) {
                 true => ("pause", "Pause"),
                 false => ("play", "Play"),
             };
-            rows.push(Node::Row(vec![
-                icon_button(&format!("play:{}", t.key), icon, tip),
-                text(format!(
-                    "{}   {} keys   {} s",
-                    t.name,
-                    t.keys(),
-                    wex_number(t.seconds())
-                )),
-            ]));
+            let name = format!(
+                "{}   {} keys   {} s",
+                t.name,
+                t.keys(),
+                wex_number(t.seconds())
+            );
+            rows.push(
+                row![button(&format!("play:{}", t.key), label, icon), name]
+                    .align(Align::Middle)
+                    .into(),
+            );
         }
-        rows.push(button("open_editor", "Track Editor", Some("edit"), true));
+        rows.push(
+            button("open_editor", "Advanced Camera", "lens")
+                .primary()
+                .wide()
+                .large(true)
+                .into(),
+        );
         rows.push(Node::Divider);
-        rows.extend(self.positions_rows("go_position"));
+        rows.extend(self.positions_rows("go_position", 3));
         if let Some(note) = &self.note {
-            rows.push(text(note.clone()));
+            rows.push(Text::new(note).ink(Ink::Marked).into());
         }
-        Node::Column(rows)
+        column(rows).into()
     }
 
-    /// The editor: the edited track in 3D and on its timeline, beside a
-    /// panel of every tool.
+    /// The editor: the track panel, the 3D view and the tabs, above the
+    /// timeline.
     pub(crate) fn editor(&self) -> Node {
         if self.unreadable {
             return self.unreadable_view();
         }
         let edited = self.track.and_then(|i| self.tracks.get(i));
         let keyed = edited.filter(|t| t.keys() > 0);
-        let start = keyed.and_then(|t| t.start).unwrap_or(self.pose);
-        let (origin, frame) = (position(&start), facing(&start));
-        let (mut path, mut key_points) = (Vec::new(), Vec::new());
-        if let Some(t) = keyed {
-            let legs = shapes(&t.steps, t.looping.closed());
-            let per = (PATH_POINTS / legs.len().max(1)).clamp(1, LEG_POINTS);
-            for leg in &legs {
-                key_points.push(path.len());
-                path.extend((0..per).map(|j| leg.point(j as f32 / per as f32)));
-            }
-            key_points.push(path.len());
-            path.push(legs.last().map_or(glam::Vec3::ZERO, |l| l.to.pos));
-        }
-        let path: Vec<[f32; 3]> = path
-            .into_iter()
-            .map(|p| (origin + frame * p).to_array())
-            .collect();
-        let times = keyed.map(|t| key_times(&t.steps)).unwrap_or_default();
-        let steps: &[Step] = keyed.map_or(&[], |t| &t.steps);
-        let closed = keyed.is_some_and(|t| t.looping.closed());
-        let main = Node::Column(vec![
-            Node::Scene3d {
-                id: "scene".to_owned(),
-                keys: key_points,
-                path,
-                selected: self.key,
-                camera: Some(self.scene_camera()),
-                overlay: key_panel(steps, self.key, closed).map(Box::new),
-                closed,
-                hint: Some(HINT.to_owned()),
-            },
-            Node::Timeline {
-                id: "timeline".to_owned(),
-                length: times.last().copied().unwrap_or(0.0),
-                keys: times.clone(),
-                selected: self.key,
-                playhead: self.playhead(),
-                lane: pace_lane(steps),
-            },
-        ]);
-        let found = self.found();
-        let mut side = vec![
-            heading("Track"),
-            name_field("search", "Search", &self.search, true),
-            Node::List {
-                id: "tracks".to_owned(),
-                items: found.iter().map(|i| self.tracks[*i].name.clone()).collect(),
-                selected: self.track.and_then(|t| found.iter().position(|i| *i == t)),
-            },
-            Node::Row(vec![
-                icon_button("new", "add", "New track"),
-                icon_button("duplicate", "duplicate", "Duplicate the track"),
-                icon_button("delete", "delete", "Delete the track"),
-            ]),
-        ];
+        let mut scene = vec![self.scene(keyed).into()];
+        scene.extend(self.note.as_ref().map(|note| {
+            Frame::new(Text::new(note).ink(Ink::Marked))
+                .surface(Surface::Raised)
+                .padding(PANEL_GAP)
+                .into()
+        }));
+        let pose_lines = self.pose_lines().map(|line| {
+            Text::new(line)
+                .size(TextSize::Small)
+                .mono(true)
+                .clip(true)
+                .width(Size::Fill)
+                .into()
+        });
+        let main = col![
+            Node::Layers(scene),
+            Flow::col(pose_lines.into()).gap(0.0).width(Size::Fill),
+        ]
+        .width(Size::Fill)
+        .height(Size::Fill);
+        let mut tracks = col![scrolled(self.library_rows(edited))];
         if let Some(t) = edited {
-            let (icon, tip) = match self.playing(&t.key) {
-                true => ("pause", "Pause"),
-                false => ("play", "Play from the chosen key"),
-            };
-            side.extend([
-                Node::Divider,
-                name_field("rename", "Name (Enter renames)", &t.name, false),
-                Node::Buttons {
-                    id: "loop".to_owned(),
-                    options: ["Open", "Closed", "Looping"].map(str::to_owned).to_vec(),
-                    selected: Some(t.looping as usize),
-                    columns: 3,
-                },
-                Node::Row(vec![
-                    icon_button("play", icon, tip),
-                    icon_button("stop", "stop", "Stop, back to the start"),
-                    Node::Copy {
-                        label: "Copy as Wex".to_owned(),
-                        text: wex(&t.steps),
-                    },
-                ]),
-                Node::Divider,
-            ]);
-            let keys = t.keys();
-            side.push(heading(&match self.key {
-                Some(0) => format!("Start of {keys} keys"),
-                Some(k) => format!("Key {} of {keys}", k + 1),
-                None => format!("{keys} keys"),
-            }));
-            if let Some(s) = self
-                .key
-                .and_then(|k| k.checked_sub(1))
-                .and_then(|i| t.steps.get(i).map(|s| (i, s)))
-            {
-                let (i, step) = s;
-                let field =
-                    |k: usize| number_node(&format!("s:{i}:{k}"), STEP_LABELS[k], Some(step[k]));
-                side.push(Node::Row((0..3).map(field).collect()));
-                side.push(Node::Row((3..6).map(field).collect()));
-                side.push(number_node(
-                    "key_time",
-                    "Time (s)",
-                    times.get(i + 1).copied(),
-                ));
-            }
-            side.push(Node::Row(vec![
-                icon_button("key_set", "target", "Set this key to the camera"),
-                icon_button(
-                    "key_insert",
-                    "keyframe",
-                    "Insert a key at the camera after this one",
-                ),
-                icon_button("key_go", "go", "Fly the camera to this key"),
-            ]));
-            side.push(Node::Row(vec![
-                icon_button("key_dup", "duplicate", "Duplicate this key's step"),
-                icon_button("key_earlier", "earlier", "Move this key earlier"),
-                icon_button("key_later", "later", "Move this key later"),
-                icon_button("key_del", "delete", "Remove this key"),
-            ]));
+            tracks = tracks.push(pinned(column(self.control_rows(t))));
         }
-        side.push(Node::Row(vec![
-            button("add_key", "Add keyframe", Some("keyframe"), false),
-            icon_button("start_here", "pin", "Start the track at the camera"),
-        ]));
-        side.push(text(self.offset_line()));
-        if steps.len() > LANE_STEPS_MAX {
-            side.push(text(LANE_TOO_LONG));
-        }
-        side.push(Node::Divider);
-        side.push(heading("Camera"));
-        side.extend(self.pads());
-        side.push(Node::Divider);
-        side.extend(self.settings_rows());
-        side.push(Node::Divider);
-        side.extend(self.positions_rows("pick_position"));
-        if let Some(p) = self.spot.and_then(|i| self.positions.get(i)) {
-            side.push(name_field(
-                "rename_position",
-                "Name (Enter renames)",
-                &p.name,
-                false,
-            ));
-            side.push(Node::Row(vec![
-                icon_button("go", "go", "Fly there"),
-                icon_button("delete_position", "delete", "Delete the position"),
-            ]));
-        }
-        if let Some(note) = &self.note {
-            side.push(text(note.clone()));
-        }
-        Node::Split {
-            main: Box::new(main),
-            side: Box::new(Node::Column(side)),
-        }
+        let tabs = Button::grid("tab", Tab::FACES, Some(self.tab as usize), 3);
+        let tab = match self.tab {
+            Tab::Key => self.key_rows(edited),
+            Tab::Fly => self.fly_rows(),
+            Tab::Lens => self.settings_rows(),
+        };
+        let panels = row![
+            panel(tracks, TRACKS_PX),
+            main,
+            panel(col![pinned(tabs), scrolled(tab)], TABS_PX),
+        ];
+        let steps = keyed.map_or(&[][..], |t| &t.steps);
+        let (keys, closed) = keyed.map_or((0, false), |t| (t.keys(), t.looping.closed()));
+        let body = col![
+            panels.gap(PANEL_PAD).height(Size::Fill),
+            timeline(steps, keys, closed, self.key, self.playhead()),
+        ];
+        Frame::new(body.height(Size::Fill))
+            .height(Size::Fill)
+            .keys(self.pad_keys())
+            .into()
     }
 
-    /// Edits the edited track at its chosen key with the camera's pose:
-    /// `edit` gets the steps, the track's start (changed in place), the key
-    /// and the pose. Without a camera, a chosen key or the track's start,
-    /// it notes what is missing and edits nothing; true when it edited.
+    /// The keys that fly the camera, whichever tab is selected.
+    fn pad_keys(&self) -> Vec<(Key, String)> {
+        Fly::PADS
+            .iter()
+            .filter(|pad| !self.leveled(pad.fly))
+            .map(|pad| (pad.key, pad.id.to_owned()))
+            .collect()
+    }
+
+    /// The 3D view: the camera, and the path and keys of `keyed`.
+    fn scene(&self, keyed: Option<&Track>) -> Scene {
+        let scene = Scene::new("scene")
+            .cameras(vec![self.scene_camera()])
+            .empty("No keyframes")
+            .hint(HINT)
+            .height(Size::Fill);
+        let Some(track) = keyed else { return scene };
+        let closed = track.looping.closed();
+        let start = track.start.unwrap_or(self.pose);
+        let (origin, heading) = (position(&start), facing(&start));
+        let legs = shapes(&track.steps, closed);
+        let samples = (PATH_POINTS / legs.len().max(1)).clamp(1, LEG_POINTS);
+        let mut path: Vec<[f32; 3]> = Vec::new();
+        let mut points = Vec::new();
+        // The end of a closed path is its first key, so it has no number.
+        let numbered = track.keys() - usize::from(closed);
+        let mut push_key = |at: [f32; 3]| {
+            let key = points.len();
+            let point = Point3::new(at).selected(self.key == Some(key));
+            points.push(match key < numbered {
+                true => point.label((key + 1).to_string()),
+                false => point,
+            });
+        };
+        let world = |offset: glam::Vec3| (origin + heading * offset).to_array();
+        for leg in &legs {
+            let curve = (0..samples).map(|j| world(leg.point(j as f32 / samples as f32)));
+            push_key(world(leg.from.pos));
+            path.extend(curve);
+        }
+        let end = world(legs.last().map_or(glam::Vec3::ZERO, |l| l.to.pos));
+        push_key(end);
+        path.push(end);
+        scene
+            .points(points)
+            .paths(vec![Path3::new(path, Stroke::new(Ink::Accent, 2.0))])
+    }
+
+    /// The track panel: the tracks, the name of the edited one, and the
+    /// positions.
+    fn library_rows(&self, edited: Option<&Track>) -> Vec<Node> {
+        let found = self.found();
+        let names = found.iter().map(|i| self.tracks[*i].name.as_str());
+        let chosen = self.track.and_then(|t| found.iter().position(|i| *i == t));
+        let mut rows: Vec<Node> = vec![
+            Text::heading("Tracks").into(),
+            name_field("search", "Search", &self.search)
+                .live(true)
+                .into(),
+            Button::list("tracks", names, chosen),
+            row![
+                button("new", "New", "add"),
+                Button::icon_only("duplicate", "duplicate", "Duplicate the track"),
+                Button::delete("delete", "").tip("Delete the track"),
+            ]
+            .into(),
+        ];
+        if let Some(t) = edited {
+            rows.push(name_field("rename", "Name (Enter renames)", &t.name).into());
+            rows.push(Button::copy("Copy as Wex", wex(&t.steps)).into());
+        }
+        rows.push(Node::Divider);
+        rows.extend(self.positions_rows("pick_position", 1));
+        if let Some(p) = self.spot.and_then(|i| self.positions.get(i)) {
+            rows.push(name_field("rename_position", "Name (Enter renames)", &p.name).into());
+            rows.push(
+                row![
+                    button("go", "Fly there", "go"),
+                    Button::delete("delete_position", "").tip("Delete the position"),
+                ]
+                .into(),
+            );
+        }
+        rows
+    }
+
+    /// The playback controls of the edited track.
+    fn control_rows(&self, t: &Track) -> Vec<Node> {
+        let (icon, label) = match self.playing(&t.key) {
+            true => ("pause", "Pause"),
+            false => ("play", "Play"),
+        };
+        vec![
+            Choice::new(
+                "loop",
+                LOOPS.map(str::to_owned).to_vec(),
+                Some(t.looping as usize),
+            )
+            .width(Size::Fill)
+            .into(),
+            row![
+                button("play", label, icon).primary().wide(),
+                Button::icon_only("stop", "stop", "Stop, back to the start"),
+            ]
+            .into(),
+        ]
+    }
+
+    /// The Key tab: adding keys, and the controls of the selected key.
+    fn key_rows(&self, edited: Option<&Track>) -> Vec<Node> {
+        let add_key = button("add_key", "Add keyframe", "keyframe").primary();
+        let keyed = edited.filter(|t| t.keys() > 0).zip(self.key);
+        let Some((t, key)) = keyed else {
+            return vec![
+                add_key.wide().into(),
+                Text::heading("No keys yet").into(),
+                "Move the camera to where the track starts, then press Add keyframe.".into(),
+            ];
+        };
+        let keys = t.keys();
+        let name = match key {
+            0 => format!("Start of {keys} keys"),
+            k => format!("Key {} of {keys}", k + 1),
+        };
+        let mut rows: Vec<Node> = vec![
+            add_key.wide().into(),
+            Text::heading(name).into(),
+            button("key_insert", "Insert after this key", "insert")
+                .wide()
+                .into(),
+            row![
+                button("key_set", "Set to camera", "target").wide(),
+                button("key_go", "Fly here", "go").wide(),
+            ]
+            .into(),
+        ];
+        let step = key.checked_sub(1).and_then(|i| Some((i, t.steps.get(i)?)));
+        if let Some((i, step)) = step {
+            rows.push(
+                row![
+                    button("key_dup", "Duplicate", "duplicate").wide(),
+                    Button::delete("key_del", "Delete").wide(),
+                ]
+                .into(),
+            );
+            rows.push(
+                row![
+                    button("key_earlier", "Earlier", "earlier").wide(),
+                    button("key_later", "Later", "later").wide(),
+                ]
+                .into(),
+            );
+            let field =
+                |k: usize| number_node(&format!("s:{i}:{k}"), STEP_LABELS[k], Some(step[k]));
+            rows.push(Node::Divider);
+            rows.push(format!("From key {key}, in metres and degrees").into());
+            rows.push(
+                Grid::new(3, (0..6).map(field).collect())
+                    .gap(PANEL_GAP)
+                    .into(),
+            );
+        }
+        rows.push(Node::Divider);
+        let time = step.map(|_| {
+            let time = key_times(&t.steps).get(key).copied();
+            number_node("key_time", "Time (s)", time)
+        });
+        rows.extend(time);
+        if t.steps.len() > RAMP_STEPS_MAX {
+            rows.push(RAMP_TOO_LONG.into());
+        }
+        rows.extend(path_rows(&t.steps, key, t.looping.closed()));
+        rows.push(Node::Divider);
+        rows.push(button("start_here", "Start the track at the camera", "pin").into());
+        rows
+    }
+
+    /// Edits the selected key with the camera's pose. `edit` takes the steps,
+    /// the track's start and its optics, the key and the pose. Returns false,
+    /// with a note for the user, if no key is selected.
     fn edit_at_camera(
         &mut self,
         edit: impl FnOnce(&mut Vec<Step>, &mut [f32; 6], &mut Option<Optics>, usize, [f32; 6]),
@@ -443,32 +578,31 @@ impl Camera {
             return false;
         }
         t.keep_optics(now);
-        let Track {
-            steps,
-            start: Some(start),
-            optics,
-            ..
-        } = t
-        else {
-            return false;
-        };
-        edit(steps, start, optics, key, pose);
-        t.reclose();
+        t.edit(|t| {
+            if let Track {
+                steps,
+                start: Some(start),
+                optics,
+                ..
+            } = t
+            {
+                edit(steps, start, optics, key, pose);
+            }
+        });
         self.save_track(i, out);
         self.save_index(out);
         true
     }
 
-    /// The edited track's last key a person moves: the end of its last
-    /// step, or of the one before a closed track's way back.
+    /// The last key of the edited track, not counting the end of a closed one.
     fn last_key(&self) -> usize {
         self.track
             .and_then(|i| self.tracks.get(i))
             .map_or(0, |t| t.steps.len() - usize::from(t.looping.closed()))
     }
 
-    /// Sets the edited track's loop: closing it adds the way back to its
-    /// start, a step like any other; opening it takes that step away.
+    /// Sets how the edited track ends. Closing it adds a step back to the
+    /// start, and opening it removes that step.
     fn set_loop(&mut self, looping: Loop, out: &mut Vec<Command>) {
         let curve = self.new_curve();
         let Some(i) = self.track.filter(|i| *i < self.tracks.len()) else {
@@ -484,35 +618,38 @@ impl Camera {
                 self.note = Some(track_full());
                 return;
             }
-            (false, true) => {
-                let mut back = with_curve([0.0; 15], curve);
-                back[6] = KEY_SECONDS;
-                t.steps.push(back);
-                t.looping = looping;
-                t.reclose();
-            }
-            (true, false) => {
-                t.steps.pop();
-                let last = t.steps.len();
-                self.key = self.key.map(|k| k.min(last));
-            }
             _ => {}
         }
-        t.looping = looping;
+        t.edit(|t| {
+            match (t.looping.closed(), looping.closed()) {
+                (false, true) => {
+                    let mut back = with_curve([0.0; 15], curve);
+                    back[6] = KEY_SECONDS;
+                    t.steps.push(back);
+                }
+                (true, false) => {
+                    t.steps.pop();
+                }
+                _ => {}
+            }
+            t.looping = looping;
+        });
+        let last = t.steps.len();
+        self.key = self.key.map(|k| k.min(last));
         self.save_track(i, out);
         self.save_index(out);
     }
 
-    /// Chooses track `i` to edit, from its start.
+    /// Selects the track to edit. [`Camera::keep_chosen`] then selects its
+    /// first key.
     fn edit(&mut self, i: Option<usize>) {
         self.track = i.filter(|i| *i < self.tracks.len());
         self.key = None;
     }
 
-    /// Plays track `i`, unless it plays: on from where the person paused
-    /// it or a key chosen since, else from the edited track's chosen key
-    /// (its start at the last key). It goes on from the camera when it
-    /// hasn't moved since the pause, else snaps to that place's key.
+    /// Plays track `i` if it isn't playing, from where it was paused or from
+    /// the selected key. It continues from the camera's pose if that hasn't
+    /// changed since the pause, and otherwise jumps to the track.
     fn play_track(&mut self, i: usize, out: &mut Vec<Command>) {
         let Some(t) = self.tracks.get(i).filter(|t| !self.playing(&t.key)) else {
             return;
@@ -562,15 +699,15 @@ impl Camera {
         );
     }
 
-    /// Flies to position `i` in `GO_SECONDS`.
+    /// Flies to position `i`.
     fn go(&mut self, i: usize, out: &mut Vec<Command>) {
         if let Some(to) = self.positions.get(i).map(|p| p.pose) {
             self.start(None, |start| Play::to(None, &to, GO_SECONDS, start), out);
         }
     }
 
-    /// The Smoothing slider at `v`: below VRChat's least strength it turns
-    /// Smooth movement off, else sets the strength and turns it on.
+    /// Sets the smoothing strength. A value below VRChat's minimum switches
+    /// smoothing off, any other switches it on.
     fn slide_smoothing(&mut self, v: f32, out: &mut Vec<Command>) {
         let least = SLIDERS
             .iter()
@@ -585,21 +722,20 @@ impl Camera {
         }
     }
 
-    /// Pauses the person's play of track `key`: Play goes on from there.
+    /// Pauses track `key`.
     fn pause(&mut self, key: &str, out: &mut Vec<Command>) {
         self.end_plays_where(|p| p.call.is_none() && p.track.as_deref() == Some(key), out);
     }
 
-    /// Ends every play and puts the edited track back at its start: the
-    /// camera there and the playhead at 0.
+    /// Stops every play and returns to the start of the edited track.
     fn stop(&mut self, out: &mut Vec<Command>) {
         self.end_plays(out);
         self.go_to_key(0, out);
     }
 
-    /// Chooses the edited track's key `key` and puts the camera there at
-    /// once, its pose and its optics, pausing the track's play; Play goes
-    /// on from there. False without a track with a start.
+    /// Selects key `key` of the edited track and moves the camera and its
+    /// optics there at once, pausing the track. Returns false if there is no
+    /// track with a start.
     fn go_to_key(&mut self, key: usize, out: &mut Vec<Command>) -> bool {
         let t = self.track.and_then(|i| self.tracks.get(i));
         let optics = t.and_then(|t| t.key_optics());
@@ -626,9 +762,8 @@ impl Camera {
         true
     }
 
-    /// The edited track scrubbed to `at` seconds: its play paused, the
-    /// camera put there at once with its optics, and Play going on from
-    /// there.
+    /// Moves the camera and its optics to `at` seconds into the edited track,
+    /// pausing it.
     fn scrub(&mut self, at: f32, out: &mut Vec<Command>) {
         let Some(t) = self.track.and_then(|i| self.tracks.get(i)) else {
             return;
@@ -642,12 +777,7 @@ impl Camera {
         let (step, into) = place_at(&steps, at);
         let pose = pose_at(&start, &steps, closed, step, into);
         self.jump_pose(pose, out);
-        let there = optics.and_then(|o| {
-            Play::path_at(None, &steps, closed, step, into, &pose)
-                .with_optics(o)
-                .optics()
-        });
-        if let Some(o) = there {
+        if let Some(o) = optics.and_then(|o| o.get(step).copied()) {
             self.set_optics(o, out);
             self.send_settings_now(out);
         }
@@ -659,39 +789,13 @@ impl Camera {
         });
     }
 
-    /// Moves key `index` (1 or more) of the edited track to `at` seconds
-    /// from its start, held between its neighbours, the others staying
-    /// put: the step into it and the step out of it share the time.
+    /// Moves key `index` of the edited track to `at` seconds ([`retime_key`]).
     fn retime(&mut self, index: usize, at: f32, out: &mut Vec<Command>) {
-        let Some(times) = self
-            .track
-            .and_then(|i| self.tracks.get(i))
-            .map(|t| key_times(&t.steps))
-        else {
-            return;
-        };
-        let Some(before) = index.checked_sub(1).and_then(|i| times.get(i)).copied() else {
-            return;
-        };
-        let after = times.get(index + 1).copied();
-        let at = at.max(before).min(after.unwrap_or(f32::INFINITY));
-        let cap = STEP_SECONDS as f32;
-        let i = index - 1;
-        self.edit_track(
-            |steps| {
-                if let Some(s) = steps.get_mut(i) {
-                    s[6] = (at - before).min(cap);
-                }
-                if let (Some(after), Some(next)) = (after, steps.get_mut(i + 1)) {
-                    next[6] = (after - at).min(cap);
-                }
-            },
-            out,
-        );
+        self.edit_track(|steps| retime_key(steps, index, at), out);
     }
 
-    /// Edits the edited track's key `key` (its step, `key - 1`): `edit`
-    /// gets the steps and that step's index.
+    /// Edits the step that leads to key `key`. `edit` takes the steps and the
+    /// index of that step.
     fn edit_key(&mut self, edit: impl FnOnce(&mut Vec<Step>, usize), out: &mut Vec<Command>) {
         let Some(at) = self.key.and_then(|k| k.checked_sub(1)) else {
             return;
@@ -706,9 +810,8 @@ impl Camera {
         );
     }
 
-    /// The camera's pose as a key at the end of the chosen track (a new
-    /// track when there is none): its start when it has none, else a step
-    /// from its last key.
+    /// Adds a key at the camera's pose to the end of the selected track, or to
+    /// a new track if there is none. The first key is the track's start.
     pub(crate) fn add_key(&mut self, out: &mut Vec<Command>) {
         if self.unreadable {
             self.note = Some(UNREADABLE.to_owned());
@@ -739,13 +842,12 @@ impl Camera {
                 self.note = Some(track_full());
             }
             Some(start) => {
-                // A closed track's new key goes before its way back.
+                // Before the step back to the start.
                 let at = t.steps.len() - usize::from(closed);
                 let step = step_to(&start, &t.steps[..at], &pose, KEY_SECONDS);
                 t.keep_optics(now);
-                t.steps
-                    .insert(at, clamp_step(with_optics(with_curve(step, curve), now)));
-                t.reclose();
+                let step = clamp_step(with_optics(with_curve(step, curve), now));
+                t.edit(|t| t.steps.insert(at, step));
                 self.key = Some(at + 1);
                 self.save_track(i, out);
                 self.save_index(out);
@@ -753,8 +855,8 @@ impl Camera {
         }
     }
 
-    /// Takes the chosen key's handle lengths as a new key's, the sides it
-    /// lacks kept as they were; true when they changed.
+    /// Keeps the selected key's handle lengths for new keys. Returns whether
+    /// they changed.
     fn remember_handles(&mut self) -> bool {
         let t = self.track.and_then(|i| self.tracks.get(i));
         let sides = t
@@ -770,9 +872,8 @@ impl Camera {
         std::mem::replace(&mut self.key_handles, handles) != handles
     }
 
-    /// Sets the chosen key's handles (the sides given) and keeps them as a
-    /// new key's. A `live` edit (a slider moving) is kept once the edits
-    /// settle ([`SAVE`]), not each time.
+    /// Sets the given handle lengths of the selected key, and keeps them for
+    /// new keys. A `live` edit is stored after a delay ([`SAVE`]).
     fn shape_key(
         &mut self,
         into: Option<f32>,
@@ -788,13 +889,7 @@ impl Camera {
         set_key_sides(&mut t.steps, key, t.looping.closed(), into, onward);
         let changed = self.remember_handles();
         match live {
-            true => {
-                self.unsaved = Some(self.tracks[i].key.clone());
-                out.push(Command::Timer {
-                    id: SAVE.to_owned(),
-                    after_ms: SAVE_MS,
-                });
-            }
+            true => self.save_later(i, out),
             false => {
                 self.save_track(i, out);
                 if changed {
@@ -804,8 +899,7 @@ impl Camera {
         }
     }
 
-    /// Keeps the track whose live edits have settled, and the handles a
-    /// new key takes.
+    /// Stores the track with a live edit, and the handle lengths of new keys.
     pub(crate) fn save_settled(&mut self, out: &mut Vec<Command>) {
         let Some(key) = self.unsaved.take() else {
             return;
@@ -816,61 +910,57 @@ impl Camera {
         }
     }
 
-    /// The pace lane's dot `index` dragged to `at` seconds and `value`
-    /// times its step's average: where along its step and how fast there;
-    /// the track is kept once it is let go (`done`).
-    fn drag_dot(&mut self, index: usize, at: f32, value: f32, done: bool, out: &mut Vec<Command>) {
+    /// Handles dragging key `index` in the timeline to `at` seconds and a ramp
+    /// height. The track is stored when the key is released (`done`), or after
+    /// a delay ([`SAVE`]).
+    fn drag_key(&mut self, index: usize, at: f32, height: f32, done: bool, out: &mut Vec<Command>) {
         let Some(i) = self.track.filter(|i| *i < self.tracks.len()) else {
             return;
         };
-        let steps = &mut self.tracks[i].steps;
-        let Some(s) = timed(steps).get(index).copied() else {
+        let t = &mut self.tracks[i];
+        if index >= t.keys() {
             return;
-        };
-        let from: f32 = steps[..s].iter().map(|s| s[6]).sum();
-        steps[s][DOT_AT] = (at - from) / steps[s][6];
-        steps[s][DOT_PACE] = value;
-        steps[s] = clamp_step(steps[s]);
-        if done {
-            self.save_track(i, out);
+        }
+        self.key = Some(index);
+        t.edit(|t| retime_key(&mut t.steps, index, at));
+        if t.steps.len() <= RAMP_STEPS_MAX {
+            // Rounded to less than a pixel of the timeline's height.
+            t.set_ramp(index, (ramp_at(height) * 10.0).round() / 10.0);
+        }
+        match done {
+            true => self.save_track(i, out),
+            false => self.save_later(i, out),
         }
     }
 
-    /// A new key's curve: the last chosen key's handle lengths, at an even
-    /// pace.
+    /// Stores track `i` when there has been no other live edit for [`SAVE_MS`].
+    fn save_later(&mut self, i: usize, out: &mut Vec<Command>) {
+        self.unsaved = Some(self.tracks[i].key.clone());
+        out.push(Command::Timer {
+            id: SAVE.to_owned(),
+            after_ms: SAVE_MS,
+        });
+    }
+
+    /// The curve of a new key.
     fn new_curve(&self) -> Curve {
         let [out, into] = self.key_handles;
-        [out, into, 0.5, 1.0]
+        [out, into, 0.0, 0.0]
     }
 
-    /// Where the camera is from the chosen track's last key, as a step:
-    /// what Add keyframe adds.
-    fn offset_line(&self) -> String {
-        let pose = self.pose;
-        let Some(t) = self.track.and_then(|i| self.tracks.get(i)) else {
-            return "Add keyframe starts a track at the camera.".to_owned();
-        };
-        let Some(start) = t.start else {
-            return "Add keyframe starts the track at the camera.".to_owned();
-        };
-        let last = t.steps.len() - usize::from(t.looping.closed());
-        let s = step_to(&start, &t.steps[..last], &pose, 0.0);
-        let n = |v: f32| wex_number((v * 100.0).round() / 100.0);
-        format!(
-            "From key {}: right {}, up {}, forward {} m; pitch {}, yaw {}, roll {}°",
-            last + 1,
-            n(s[0]),
-            n(s[1]),
-            n(s[2]),
-            n(s[3]),
-            n(s[4]),
-            n(s[5]),
-        )
+    /// The camera's position and angles, in columns of a fixed width.
+    fn pose_lines(&self) -> [String; 2] {
+        let [x, y, z, pitch, yaw, roll] = in_range(self.pose);
+        [
+            format!("x     {x:>8.2}  y   {y:>8.2}  z    {z:>8.2} m"),
+            format!("pitch {pitch:>8.2}  yaw {yaw:>8.2}  roll {roll:>8.2}°"),
+        ]
     }
 
-    /// Keeps a track chosen while any exist, and the stand-in at a newly
-    /// chosen track's start unless something moves it; while the editor is
-    /// open, a chosen track with steps but no start starts at the camera.
+    /// Keeps a track and one of its keys selected, as long as there are any,
+    /// and puts the stand-in at the start of a newly selected track unless it
+    /// is moving. While the editor is open, a track with steps but no start
+    /// gets its start from the camera.
     pub(crate) fn keep_chosen(&mut self, out: &mut Vec<Command>) {
         match self.tracks.len().checked_sub(1) {
             None => {
@@ -894,6 +984,9 @@ impl Camera {
         }
         let Some(i) = self.track else { return };
         let t = &mut self.tracks[i];
+        if t.keys() > 0 {
+            self.key.get_or_insert(0);
+        }
         if self.editor_open && t.start.is_none() && !t.steps.is_empty() {
             t.start = Some(self.pose);
             self.save_index(out);
@@ -920,7 +1013,7 @@ impl Camera {
             return self.slide_smoothing(v, out);
         }
         if id == "key_time" {
-            if let Some(key) = self.key.filter(|k| *k >= 1) {
+            if let Some(key) = self.key {
                 self.retime(key, v, out);
             }
             return;
@@ -989,8 +1082,7 @@ impl Camera {
             return;
         }
         match id {
-            // The person's explicit choice, the only thing that writes over a
-            // library this client couldn't read.
+            // The only action that overwrites a library that couldn't be read.
             "library_reset" => {
                 self.unreadable = false;
                 self.tracks.clear();
@@ -1002,7 +1094,7 @@ impl Camera {
                 self.library_changed = true;
                 self.save_index(out);
             }
-            "capture" | "capture_delayed" | "close" => self.on_call(None, id, &[], out),
+            "capture" | "capture_delayed" => self.on_call(None, id, &[], out),
             "open_editor" => self.editor_open = true,
             "new" => {
                 let name = self.copy_name("Track");
@@ -1020,7 +1112,7 @@ impl Camera {
                     self.edit(Some(last));
                 }
             }
-            // The track below takes its place, or the one above the last.
+            // Selects the next track, or the previous one if it was the last.
             "delete" => {
                 if let Some(i) = self.track.filter(|i| *i < self.tracks.len()) {
                     let t = self.tracks.remove(i);
@@ -1044,11 +1136,13 @@ impl Camera {
             "start_here" => {
                 let now = self.optics_now();
                 if let Some(i) = self.track.filter(|i| *i < self.tracks.len()) {
+                    let pose = self.pose;
                     let t = &mut self.tracks[i];
                     t.keep_optics(now);
-                    t.start = Some(self.pose);
-                    t.optics = Some(now);
-                    t.reclose();
+                    t.edit(|t| {
+                        t.start = Some(pose);
+                        t.optics = Some(now);
+                    });
                     self.key = Some(0);
                     self.save_track(i, out);
                     self.save_index(out);
@@ -1117,7 +1211,7 @@ impl Camera {
             }
             "key_del" if self.key.is_some_and(|k| k > self.last_key()) => {
                 self.note = Some(
-                    "A closed track ends at its start: set it to Open to remove the way back."
+                    "A closed track ends at its start: set it to play once to remove the way back."
                         .to_owned(),
                 );
             }
@@ -1171,7 +1265,7 @@ impl Camera {
             UiEvent::Toggled { id, value } if id == "local_nav" => self.local_nav = value,
             UiEvent::Toggled { id, value } => self.on_write(&id, &Value::Bool(value), out),
             UiEvent::Held { id, down } => {
-                if let Some(fly) = id.strip_prefix("fly:").and_then(Fly::of) {
+                if let Some(fly) = Fly::of_id(&id) {
                     self.fly_held(fly, down, out);
                 }
             }
@@ -1186,17 +1280,13 @@ impl Camera {
                 self.look[1] += y as f32;
                 self.wind(out);
             }
-            UiEvent::Moved { id, index, value } if id == "timeline" && index >= 1 => {
-                self.key = Some(index);
-                self.retime(index, value as f32, out);
-            }
             UiEvent::Dragged {
                 id,
                 index,
                 at,
                 value,
                 done,
-            } if id == "timeline" => self.drag_dot(index, at as f32, value as f32, done, out),
+            } if id == "timeline" => self.drag_key(index, at as f32, value as f32, done, out),
             UiEvent::Scrubbed { id, at } if id == "timeline" => self.scrub(at as f32, out),
             UiEvent::Chosen { id, index } => match id.as_str() {
                 "key_shape" => {
@@ -1224,10 +1314,14 @@ impl Camera {
                         self.save_index(out);
                     }
                 }
+                "tab" => {
+                    if let Some(tab) = Tab::ALL.get(index) {
+                        self.tab = *tab;
+                    }
+                }
                 "loop" => {
-                    let looping = [Loop::Open, Loop::Closed, Loop::Looping];
-                    if let Some(l) = looping.get(index) {
-                        self.set_loop(*l, out);
+                    if let Some(looping) = Loop::ALL.get(index) {
+                        self.set_loop(*looping, out);
                     }
                 }
                 _ => {}
