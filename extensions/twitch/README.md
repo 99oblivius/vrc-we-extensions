@@ -63,7 +63,7 @@ The sign-in is the **device authorization grant** for a public client — the on
 3. **Poll.** `POST /oauth2/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code` at the interval Twitch gave, until it answers the pair — or `authorization_pending` (ask again), `slow_down` (widen the interval), or an expiry (start over).
 4. **Keep.** `auth` holds `Bearer <access>`; `refresh` holds the one-time refresh token.
 5. **Name.** `GET /oauth2/validate` reports the account, the scopes and the remaining life; the renewal timer is set a minute before it ends.
-6. **Renew.** `POST /oauth2/token` with `grant_type=refresh_token` and no secret. Twitch rotates the pair, and both halves replace the old ones. A refresh token unused for 30 days expires, and the page asks the person to connect again: one click.
+6. **Renew.** `POST /oauth2/token` with `grant_type=refresh_token` and no secret. Twitch rotates the pair, and both halves replace the old ones. Only a 400 or a 401 ends the sign-in; any other answer, and none, is asked again. A refresh token unused for 30 days expires, and the page asks the person to connect again: one click.
 
 A group whose scope the token lacks is not subscribed, and the page names it and offers the approval again. A create Twitch refuses stays refused until **Reconnect** or a new token, and the page says what Twitch said. An action refused with 403 names the scope it needed. A 401 renews the token and sends the request that met it again, once; a second one is reported. A refused renewal says what Twitch said and asks to connect again. An action's reply means the request went out, not that Twitch accepted it: a failure shows in `error` and on the page.
 

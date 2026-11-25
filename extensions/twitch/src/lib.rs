@@ -855,12 +855,17 @@ impl Twitch {
                 if !self.refreshing {
                     return;
                 }
-                let (refresh, client) = match (value, self.client_id().map(str::to_owned)) {
-                    (Some(refresh), Some(client)) => (refresh, client),
-                    _ => {
-                        self.expired(out, "Twitch refused the token: connect again.".into());
-                        return;
-                    }
+                // None may be a keyring that can't be read now: nothing is
+                // known against the sign-in.
+                let Some(refresh) = value else {
+                    let why = "The refresh token couldn't be read: press Reconnect.";
+                    self.signed_out(out, Login::Out, why.into());
+                    return;
+                };
+                let Some(client) = self.client_id().map(str::to_owned) else {
+                    let why = "Twitch refused the token: connect again.";
+                    self.signed_out(out, Login::Expired, why.into());
+                    return;
                 };
                 self.request(
                     out,
@@ -1002,17 +1007,18 @@ impl Twitch {
                     self.error = None;
                     self.accepted(out, token);
                 }
-                (500.., _) => {
-                    let why = format!("the renewal failed ({status})");
-                    self.renew_again(out, why);
-                }
                 // Twitch refused the renewal itself (`invalid_grant` once the
                 // refresh token is spent, which a public client's is after 30
                 // days): say what it said, and ask for a new token.
-                _ => {
+                (400 | 401, _) => {
                     let why = protocol::parse_error(&parsed)
                         .unwrap_or_else(|| format!("the renewal was refused ({status})"));
-                    self.expired(out, why);
+                    self.signed_out(out, Login::Expired, why);
+                }
+                // Anything else says nothing of the token.
+                _ => {
+                    let why = format!("the renewal failed ({status})");
+                    self.renew_again(out, why);
                 }
             },
             Pending::Device => {
@@ -1324,14 +1330,14 @@ impl Twitch {
         }
     }
 
-    /// A token that can't be renewed: the page asks for a new one. The
-    /// keyring keeps what it holds, since only Forget removes it.
-    fn expired(&mut self, out: &mut Vec<Command>, why: String) {
+    /// A token that can't be renewed: the page asks for a new one, or for
+    /// the keyring. What it holds stays, since only Forget removes it.
+    fn signed_out(&mut self, out: &mut Vec<Command>, login: Login, why: String) {
         self.drop_link(out);
         cancel(out, &["refresh"]);
         self.waiting.clear();
         self.refreshing = false;
-        self.login = Login::Expired;
+        self.login = login;
         self.error = Some(why);
     }
 
@@ -1354,13 +1360,13 @@ impl Twitch {
             "cancel" => self.cancel_device(out),
             "forget" => self.logout(out),
             // Everything is asked again: what was refused, the token, the
-            // socket.
+            // socket. A renewal under way is kept: Twitch may have spent the
+            // refresh token already, and its answer is the only new one.
             "reconnect" => {
                 self.drop_link(out);
                 self.pending
-                    .retain(|_, p| matches!(p, Pending::Action { .. }));
+                    .retain(|_, p| matches!(p, Pending::Action { .. } | Pending::Refresh));
                 cancel(out, &["after-token"]);
-                self.refreshing = false;
                 self.login = Login::Checking;
                 self.error = None;
                 out.push(Command::LoadSecret {
@@ -2753,6 +2759,85 @@ mod tests {
         assert_eq!(t.login, Login::Expired);
         assert_eq!(line(&out), Some((Tone::Bad, "Sign-in expired".to_owned())));
         assert!(page(&out).is_some_and(|p| p.contains("connect")));
+    }
+
+    /// A renewal of a signed-in module, at its request.
+    fn renewing() -> (Twitch, u64) {
+        let mut t = signed_in(&[]);
+        t.handle(Event::Timer {
+            id: "refresh".into(),
+            at_ms: 0,
+        });
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_REFRESH.into(),
+            value: Some("r1".into()),
+        });
+        let id = request_to(&out, protocol::TOKEN_URL);
+        (t, id)
+    }
+
+    /// Twitch spends the old refresh token as it answers, so the answer's is
+    /// the only one left.
+    #[test]
+    fn reconnect_keeps_the_token_a_renewal_under_way_brings() {
+        let (mut t, id) = renewing();
+        t.handle(Event::Ui {
+            page: PAGE.into(),
+            event: UiEvent::Pressed {
+                id: "reconnect".into(),
+            },
+        });
+        let out = t.handle(Event::Http {
+            id,
+            response: answer(
+                200,
+                r#"{"access_token":"new","refresh_token":"r2","expires_in":3600,"scope":[]}"#,
+            ),
+        });
+        assert!(out.iter().any(
+            |c| matches!(c, Command::StoreSecret { slot, value } if slot == SECRET_REFRESH && value == "r2")
+        ));
+        assert!(!requests_to(&out, protocol::VALIDATE_URL).is_empty());
+    }
+
+    #[test]
+    fn only_a_refused_renewal_expires_the_sign_in() {
+        for status in [403, 404, 429, 503] {
+            let (mut t, id) = renewing();
+            let out = t.handle(Event::Http {
+                id,
+                response: answer(status, "{}"),
+            });
+            assert_eq!(t.login, Login::In, "{status}");
+            assert!(
+                out.iter()
+                    .any(|c| matches!(c, Command::Timer { id, .. } if id == "refresh")),
+                "{status} goes again"
+            );
+        }
+        for status in [400, 401] {
+            let (mut t, id) = renewing();
+            t.handle(Event::Http {
+                id,
+                response: answer(status, "{}"),
+            });
+            assert_eq!(t.login, Login::Expired, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_refresh_token_that_cant_be_read_is_no_refusal() {
+        let mut t = signed_in(&[]);
+        t.handle(Event::Timer {
+            id: "refresh".into(),
+            at_ms: 0,
+        });
+        let out = t.handle(Event::SecretLoaded {
+            slot: SECRET_REFRESH.into(),
+            value: None,
+        });
+        assert_eq!(t.login, Login::Out);
+        assert!(page(&out).is_some_and(|p| p.contains("reconnect")));
     }
 
     #[test]
